@@ -12955,54 +12955,124 @@ function showTypingIndicator() {
 
 
 
+/* ============================================================
+   UltraTextMatcherTF — FAST LITE EDITION (drop-in replacement)
+   ------------------------------------------------------------
+   ✅ Same public API as your original:
+      - new UltraTextMatcherTF(targets, options)
+      - init(), setTargets(), setOptions()
+      - addTarget(), removeTargetById(), updateTargetById()
+      - clearCaches(), disposeModel()
+      - match(query, targetsOverride, optionsOverride)
 
+   ✅ Same output shape (results, breakdown, diagnostics, stats)
+   ✅ No TFJS / USE model load (works even if tf/use missing)
+   ✅ Ultra fast: removes heavy grammar/lev/TFJS tensors
+   ✅ Still “closest match” via:
+      - token overlap + BM25-lite
+      - char 3-gram Jaccard
+      - numeric similarity
+      - cheap hashed-semantic cosine (256 dims)
 
+   ============================================================ */
+
+/* ---------------------------
+   Small helpers (safe)
+--------------------------- */
+function safeStr(x) {
+  if (x === null || x === undefined) return "";
+  if (typeof x === "string") return x;
+  if (typeof x === "number" || typeof x === "boolean") return String(x);
+  try { return JSON.stringify(x); } catch { return String(x); }
+}
+function joinClean(arr, sep = " | ") {
+  return arr.map(safeStr).map(s => s.trim()).filter(Boolean).join(sep);
+}
+function pick(obj, path, fallback = undefined) {
+  try {
+    const parts = path.split(".");
+    let cur = obj;
+    for (const p of parts) {
+      if (!cur || typeof cur !== "object") return fallback;
+      cur = cur[p];
+    }
+    return cur === undefined ? fallback : cur;
+  } catch {
+    return fallback;
+  }
+}
+function flattenObject(obj, maxPairs = 40) {
+  if (!obj || typeof obj !== "object") return "";
+  const out = [];
+  const keys = Object.keys(obj);
+  for (let i = 0; i < keys.length && out.length < maxPairs; i++) {
+    const k = keys[i];
+    const v = obj[k];
+    if (v === null || v === undefined) continue;
+    if (typeof v === "object") continue;
+    out.push(`${k}: ${safeStr(v)}`);
+  }
+  return out.join("; ");
+}
+function defaultFieldWeights() {
+  return {
+    name: 1.00,
+    brand: 0.55,
+    model: 0.60,
+    tags: 0.45,
+    category: 0.35,
+    description: 0.30,
+    specifications: 0.25,
+    seller: 0.15
+  };
+}
+function clamp01(x) {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  return x;
+}
+
+/* ============================================================
+   UltraTextMatcherTF (FAST)
+   ============================================================ */
 class UltraTextMatcherTF {
-  // =====================================================================
-  // SECTION A — Construction & Defaults
-  // =====================================================================
-
   constructor(targets = null, options = null) {
-    this._version = "2.0.0";
+    this._version = "2.0.1-fast";
     this._inited = false;
 
-    // TFJS / Model
-    this._model = null;         // USE model instance
-    this._backend = null;       // backend string
-    this._modelName = "universal-sentence-encoder";
-    this._tfReady = false;
+    // kept for compatibility (not used)
+    this._model = null;
+    this._backend = "js-fast";
+    this._modelName = "lite-hash-semantic";
+    this._tfReady = true;
 
-    // Targets storage (supports live updates)
-    this._targets = [];         // normalized objects: { text, meta, id }
-    this._targetText = [];      // parallel
-    this._targetMeta = [];      // parallel
-    this._targetIds = [];       // parallel
+    // Targets
+    this._targets = [];
+    this._targetText = [];
+    this._targetMeta = [];
+    this._targetIds = [];
 
-    // Indexes / stats
-    this._bm25 = null;          // BM25 corpus stats
+    // BM25-lite stats (fast)
+    this._bm25 = null;
     this._lastBm25BuildAt = 0;
 
     // Caches
-    this._featureCache = new Map();        // key: "T:<index>" -> features
-    this._queryFeatureCache = new Map();   // key: "Q:<query>" -> features
-    this._embedLRU = new Map();            // key: embeddingKey -> { vec: Float32Array, bytes, lastUsed, dim }
+    this._featureCache = new Map();
+    this._queryFeatureCache = new Map();
+    this._embedLRU = new Map();
     this._embedLRUBytes = 0;
 
     // Options
     this._options = this._deepMerge(this._defaultOptions(), options || {});
     this._normalizeFactorWeights(this._options);
 
-    // Attach targets if provided
     if (targets) this.setTargets(targets);
   }
 
   _defaultOptions() {
     return {
-      // ------------------------------------------------------------
-      // Debug controls
-      // ------------------------------------------------------------
       debug: {
-        enabled: false,           // master
+        enabled: false,
         logTimings: true,
         logWarnings: true,
         logBatches: false,
@@ -13012,11 +13082,6 @@ class UltraTextMatcherTF {
         groupCollapsed: true
       },
 
-      // ------------------------------------------------------------
-      // Runtime weight focus knobs (multipliers)
-      // If you manually set factor weights, those values are used,
-      // then focus multipliers further amplify them.
-      // ------------------------------------------------------------
       focus: {
         favorMeaning: 1.0,
         favorNumbers: 1.0,
@@ -13029,74 +13094,42 @@ class UltraTextMatcherTF {
         favorCase: 1.0
       },
 
-      // ------------------------------------------------------------
-      // Performance controls
-      // ------------------------------------------------------------
       perf: {
         topK: 5,
         maxTargetsSafety: 200000,
-        semanticBatchSize: 64,
+        semanticBatchSize: 128, // (unused now, but kept)
         microYield: {
           enabled: true,
-          everyItems: 64,         // yield after this many candidates
-          strategy: "timeout0"    // "timeout0" | "raf" | "idle"
+          everyItems: 256,
+          strategy: "timeout0"
         },
-        timeBudgetMs: 0,          // 0 disables. Otherwise soft stop.
-        nonSemanticFastPath: false // if true, skip some heavy string ops for very large corpora
+        timeBudgetMs: 0,
+        nonSemanticFastPath: true
       },
 
-      // ------------------------------------------------------------
-      // TFJS controls
-      // ------------------------------------------------------------
+      // kept for compatibility
       tfjs: {
         preferredBackends: ["webgl", "wasm", "cpu"],
         forceBackend: "",
-        warmup: true,
-        modelUrl: "",     // optional; usually unnecessary
-        // if wasm is chosen, user must load tfjs-backend-wasm separately; we do not auto-load.
-        // we simply attempt to setBackend in priority order.
+        warmup: false,
+        modelUrl: ""
       },
 
-      // ------------------------------------------------------------
-      // Cache controls
-      // ------------------------------------------------------------
       cache: {
         featureCache: true,
         queryFeatureCache: true,
         embeddingCache: true,
-        embeddingCacheKey: "text",   // "text" | "hash"
-        embeddingCacheLimitMB: 128,
+        embeddingCacheKey: "hash",   // hash is faster than storing huge text keys
+        embeddingCacheLimitMB: 64,
         autoClearAfterMatch: false,
         clearEmbedCacheAfterMatch: false,
         clearFeatureCacheAfterMatch: false,
         clearQueryCacheAfterMatch: false
       },
 
-      // ------------------------------------------------------------
-      // Metadata filtering/boosting (multi-purpose string search)
-      // - NO recency by default
-      // - Uses importance signals: priority/rank/quality/weight
-      // ------------------------------------------------------------
       meta: {
         enabled: true,
-
-        // Filter can be:
-        // - null
-        // - function(meta, text, index) => boolean
-        // - object rules:
-        //   { allowTags?, blockTags?, allowAnyTags?, blockAnyTags?, allowTypes?, blockTypes?, allowChannels?, blockChannels?,
-        //     requireFields?, minPriority?, maxPriority?, minQuality?, maxQuality? }
         filter: null,
-
-        // Boost can be:
-        // - null
-        // - function(meta, text, index, queryFeatures) => { addScore01?, multScore?, notes? }
-        // - object rules:
-        //   { tagBoost?, typeBoost?, channelBoost?, authorBoost?, importanceField?, importanceMode?, importanceScale?, clampAdd?, clampMult? }
-        //
-        // importanceField defaults: "priority" then "rank" then "quality" then "weight"
-        // importanceMode: "linear" | "sigmoid"
-        // importanceScale: how strongly importance affects addScore01
         boost: {
           importanceField: "auto",
           importanceMode: "sigmoid",
@@ -13109,233 +13142,91 @@ class UltraTextMatcherTF {
           clampMultMin: 0.70,
           clampMultMax: 1.35
         },
-
         includeMetaInDiagnostics: false
       },
 
-      // ------------------------------------------------------------
-      // Fusion: robust weighted power mean + penalties + sigmoid confidence
-      // ------------------------------------------------------------
       fusion: {
-        powerMeanP: 2.8,
-
+        powerMeanP: 2.2,
         contradiction: {
           enabled: true,
-          semanticVsNumeric: {
-            enabled: true,
-            semanticHigh: 0.80,
-            numericLow: 0.25,
-            penaltyMax: 0.35
-          },
-          semanticVsTokens: {
-            enabled: true,
-            semanticHigh: 0.82,
-            tokenLow: 0.20,
-            penaltyMax: 0.18
-          }
+          semanticVsNumeric: { enabled: true, semanticHigh: 0.82, numericLow: 0.25, penaltyMax: 0.28 },
+          semanticVsTokens: { enabled: true, semanticHigh: 0.84, tokenLow: 0.22, penaltyMax: 0.14 }
         },
-
         confidence: {
           center: 0.62,
-          steepness: 9.5,
-          agreementBoost: 0.12,
-          dispersionPenalty: 0.14,
+          steepness: 9.0,
+          agreementBoost: 0.10,
+          dispersionPenalty: 0.12,
           capIfSemanticLow: true
         }
       },
 
-      // ------------------------------------------------------------
-      // 16 Mandatory factor weights
-      // IMPORTANT: raw exactness should NOT dominate
-      // ------------------------------------------------------------
+      // Keep same factor weights (you can tune)
       factorWeights: {
-        // 1
         numericSimilarity: 0.85,
-        // 2
         alphabeticSimilarity: 0.35,
-        // 3
         upperCasePatternSimilarity: 0.14,
-        // 4
         lowerCasePatternSimilarity: 0.10,
-        // 5
         spacesSimilarity: 0.12,
-        // 6
         punctuationSimilarity: 0.18,
-        // 7 (MOST IMPORTANT)
-        humanMeaningSimilarity: 2.75,
-        // 8
-        wordsSimilarity: 1.20,
-        // 9
-        wordsSimilarityNoGrammar: 0.75,
-        // 10
-        wordsSimilarityWithGrammar: 0.50,
-        // 11
-        emojiSimilarity: 0.22,
-        // 12
-        firstSectionSimilarity: 0.45,
-        // 13
-        secondSectionSimilarity: 0.30,
-        // 14
-        followGrammarSimilarity: 0.62,
-        // 15
-        verbSimilarity: 0.36,
-        // 16
-        auxiliaryVerbSimilarity: 0.26
+        humanMeaningSimilarity: 2.10,  // slightly reduced to keep fast signals balanced
+        wordsSimilarity: 1.10,
+        wordsSimilarityNoGrammar: 0.60,
+        wordsSimilarityWithGrammar: 0.35,
+        emojiSimilarity: 0.10,
+        firstSectionSimilarity: 0.40,
+        secondSectionSimilarity: 0.25,
+        followGrammarSimilarity: 0.20,
+        verbSimilarity: 0.10,
+        auxiliaryVerbSimilarity: 0.10
       },
 
-      // ------------------------------------------------------------
-      // Factor-specific configs
-      // ------------------------------------------------------------
       factorConfig: {
-        numeric: {
-          maxNumbers: 64,
-          relativeEps: 1e-6,
-          closenessAlpha: 0.85
-        },
+        numeric: { maxNumbers: 48, relativeEps: 1e-6, closenessAlpha: 0.85 },
 
-        alphabetic: {
-          charNGramN: 3,
-          charNGramMax: 5000,
-          editDistanceMaxLen: 900
-        },
+        alphabetic: { charNGramN: 3, charNGramMax: 900, editDistanceMaxLen: 0 }, // editDistance disabled
 
-        casePattern: {
-          bins: 24
-        },
-
-        spaces: {
-          runMax: 80,
-          bins: 24
-        },
-
-        punctuation: {
-          trackPositions: true,
-          maxPositions: 256,
-          bins: 24
-        },
+        casePattern: { bins: 12 },
+        spaces: { runMax: 40, bins: 12 },
+        punctuation: { trackPositions: false, maxPositions: 0, bins: 12 },
 
         semantic: {
+          // now: hashed semantic cosine
           enableFloor: true,
-          cosineFloor: -0.15
+          cosineFloor: -0.20,
+          hashDims: 256
         },
 
         words: {
           minTokenLen: 2,
-          maxTokens: 256,
-          maxTokenGrams: 4096,
+          maxTokens: 64,           // MUCH smaller => much faster
+          maxTokenGrams: 0,        // disable bigrams for speed
           tokenGramN: 2,
-          bm25: { k1: 1.2, b: 0.75 }
+          bm25: { k1: 1.1, b: 0.72 }
         },
 
-        nogrammar: {
-          stripSuffixes: ["ing", "ed", "es", "s"],
-          minRootLen: 3
-        },
+        nogrammar: { stripSuffixes: ["ing", "ed", "es", "s"], minRootLen: 3 },
+        grammarWords: { morphologySensitivity: 0.55, maxEditDistanceLen: 0 }, // edit disabled
 
-        grammarWords: {
-          morphologySensitivity: 0.70,
-          maxEditDistanceLen: 240
-        },
+        emoji: { maxEmoji: 0, positionalWeight: 0, bins: 0 }, // disabled
+        sections: { firstChars: 120, secondChars: 140, jaroPrefixScale: 0.0 }, // no JW
 
-        emoji: {
-          maxEmoji: 64,
-          positionalWeight: 0.35,
-          bins: 24
-        },
-
-        sections: {
-          firstChars: 140,
-          secondChars: 170,
-          jaroPrefixScale: 0.10
-        },
-
-        grammar: {
-          maxSentences: 12,
-          maxClauseLen: 240,
-          svoWindow: 7,
-          punctuationPatternWeight: 0.35,
-          posHeuristicWeight: 0.35,
-          functionWordWeight: 0.30
-        },
-
-        verbs: {
-          maxVerbs: 64,
-          positionalWeight: 0.30,
-          bins: 24
-        },
-
-        aux: {
-          positionalWeight: 0.25,
-          bins: 24
-        }
+        grammar: { maxSentences: 0, maxClauseLen: 0, svoWindow: 0, punctuationPatternWeight: 0, posHeuristicWeight: 0, functionWordWeight: 0 },
+        verbs: { maxVerbs: 0, positionalWeight: 0, bins: 0 },
+        aux: { positionalWeight: 0, bins: 0 }
       }
     };
   }
 
-  // =====================================================================
-  // SECTION B — Public API
-  // =====================================================================
+  /* ===================== PUBLIC API ===================== */
 
   async init() {
+    // FAST: no TF/USE loading
     if (this._inited) return;
-
-    if (typeof tf === "undefined") {
-      throw new Error("TensorFlow.js (tf) not found. Load https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest");
-    }
-    if (typeof use === "undefined") {
-      throw new Error("Universal Sentence Encoder (use) not found. Load https://cdn.jsdelivr.net/npm/@tensorflow-models/universal-sentence-encoder@latest");
-    }
-
-    // Ensure TFJS is ready
-    await tf.ready();
-    this._tfReady = true;
-
-    // Pick backend
-    const opt = this._options;
-    let backend = opt.tfjs.forceBackend || "";
-    if (!backend) backend = await this._pickBestBackend(opt.tfjs.preferredBackends);
-
-    if (backend) {
-      try {
-        await tf.setBackend(backend);
-        await tf.ready();
-      } catch (e) {
-        this._dWarn(opt, "Failed to set backend:", backend, e);
-      }
-    }
-
-    this._backend = tf.getBackend();
-
-    // Load USE
-    const t0 = this._now();
-    try {
-      if (opt.tfjs.modelUrl && typeof use.load === "function") {
-        // Some versions accept config; fallback to no-arg
-        try {
-          this._model = await use.load({ modelUrl: opt.tfjs.modelUrl });
-        } catch (_e) {
-          this._model = await use.load();
-        }
-      } else {
-        this._model = await use.load();
-      }
-    } catch (e) {
-      throw new Error("Failed to load USE model. Ensure you are ONLINE and the USE script is loaded. " + e);
-    }
-    const t1 = this._now();
-
-    // Warmup (safe)
-    if (opt.tfjs.warmup) {
-      try {
-        await this._warmupModel(opt);
-      } catch (e) {
-        // Non-fatal
-        this._dWarn(opt, "Warmup failed (non-fatal):", e);
-      }
-    }
-
     this._inited = true;
-    this._dInfo(opt, `init() done. backend=${this._backend} model=${this._modelName} ms=${(t1 - t0).toFixed(1)}`);
+    this._backend = "js-fast";
+    this._tfReady = true;
+    this._dInfo(this._options, `init() done. backend=${this._backend} model=${this._modelName}`);
   }
 
   setTargets(list) {
@@ -13352,15 +13243,14 @@ class UltraTextMatcherTF {
     this._targetIds = [];
 
     for (let i = 0; i < arr.length; i++) {
-      const it = arr[i];
-      const norm = this._normalizeTargetItem(it);
+      const norm = this._normalizeTargetItem(arr[i]);
       this._targets.push(norm);
       this._targetText.push(norm.text);
       this._targetMeta.push(norm.meta);
       this._targetIds.push(norm.id);
     }
 
-    // Rebuild BM25
+    // BM25-lite build
     this._bm25 = this._buildBM25(this._targetText, opt.factorConfig.words);
     this._lastBm25BuildAt = Date.now();
 
@@ -13373,7 +13263,6 @@ class UltraTextMatcherTF {
     this._normalizeFactorWeights(this._options);
   }
 
-  // Live update: add
   addTarget(item) {
     const opt = this._options;
     if (this._targets.length + 1 > opt.perf.maxTargetsSafety) return -1;
@@ -13386,36 +13275,30 @@ class UltraTextMatcherTF {
     this._targetMeta.push(norm.meta);
     this._targetIds.push(norm.id);
 
-    // BM25 rebuild for correctness (can be optimized)
     this._bm25 = this._buildBM25(this._targetText, opt.factorConfig.words);
     this._lastBm25BuildAt = Date.now();
 
     return idx;
   }
 
-  // Live update: remove by id
   removeTargetById(id) {
     if (!id) return false;
     const idx = this._targetIds.indexOf(id);
     if (idx < 0) return false;
 
-    // Remove
     this._targets.splice(idx, 1);
     this._targetText.splice(idx, 1);
     this._targetMeta.splice(idx, 1);
     this._targetIds.splice(idx, 1);
 
-    // Clear feature cache (indexes changed)
     if (this._options.cache.featureCache) this._featureCache.clear();
 
-    // BM25 rebuild
     this._bm25 = this._buildBM25(this._targetText, this._options.factorConfig.words);
     this._lastBm25BuildAt = Date.now();
 
     return true;
   }
 
-  // Live update: update by id
   updateTargetById(id, newItem) {
     if (!id) return false;
     const idx = this._targetIds.indexOf(id);
@@ -13423,18 +13306,14 @@ class UltraTextMatcherTF {
 
     const prev = this._targets[idx];
     const norm = this._normalizeTargetItem(newItem);
-
-    // Preserve id if not provided
     norm.id = prev.id;
 
     this._targets[idx] = norm;
     this._targetText[idx] = norm.text;
     this._targetMeta[idx] = norm.meta;
 
-    // Clear feature cache entry for that index
     if (this._options.cache.featureCache) this._featureCache.delete(this._tKey(idx));
 
-    // BM25 rebuild
     this._bm25 = this._buildBM25(this._targetText, this._options.factorConfig.words);
     this._lastBm25BuildAt = Date.now();
 
@@ -13448,156 +13327,116 @@ class UltraTextMatcherTF {
   }
 
   disposeModel() {
-    // USE model may not expose dispose reliably; drop reference
     this._model = null;
     this._inited = false;
     this.clearCaches();
   }
 
-  // Main match
-    async match(query, targetsOverride = null, optionsOverride = null) {
+  async match(query, targetsOverride = null, optionsOverride = null) {
     const tStart = this._now();
 
-    // 1️⃣ merge options
     let opt = this._deepMerge(this._options, optionsOverride || {});
     this._normalizeFactorWeights(opt);
 
-    // 2️⃣ 🔒 PERF SAFETY BLOCK (MUST BE HERE)
+    // PERF SAFETY
     opt.perf = opt.perf || {};
     opt.perf.microYield = opt.perf.microYield || { enabled: false };
-    opt.perf.semanticBatchSize =
-        opt.perf.semanticBatchSize ??
-        this._options.perf.semanticBatchSize ??
-        64;
-    opt.perf.maxTargetsSafety =
-        opt.perf.maxTargetsSafety ??
-        this._options.perf.maxTargetsSafety ??
-        200000;
+    opt.perf.semanticBatchSize = opt.perf.semanticBatchSize ?? this._options.perf.semanticBatchSize ?? 128;
+    opt.perf.maxTargetsSafety = opt.perf.maxTargetsSafety ?? this._options.perf.maxTargetsSafety ?? 200000;
 
-    // 3️⃣ এখন নিচের সব code safe
-
-    // Apply focus multipliers (without deleting manual weights)
+    // Focus multipliers
     opt = this._applyFocus(opt);
 
-    // Ensure init
     if (!this._inited) await this.init();
 
-    // Resolve target arrays
     const resolved = this._resolveTargets(targetsOverride);
     const targetText = resolved.text;
     const targetMeta = resolved.meta;
     const targetIds = resolved.ids;
 
-    const tensorsBefore = this._safeNumTensors();
-    const backend = (typeof tf !== "undefined") ? tf.getBackend() : "unknown";
-
     query = (query === null || query === undefined) ? "" : String(query);
 
     if (targetText.length === 0) {
-      return this._formatEmptyResult(query, opt, tStart, 0, backend, tensorsBefore);
+      return this._formatEmptyResult(query, opt, tStart, 0, this._backend, -1);
     }
 
-    // Meta filter
     const candIdx = this._applyMetaFilterIndices(opt, targetText, targetMeta);
     if (candIdx.length === 0) {
-      return this._formatEmptyResult(query, opt, tStart, 0, backend, tensorsBefore);
+      return this._formatEmptyResult(query, opt, tStart, 0, this._backend, -1);
     }
 
-    // Query features
     const qFeat = this._getQueryFeatures(query, opt);
 
-    // BM25 stats
-    const bm25 = (targetsOverride ? this._buildBM25(targetText, opt.factorConfig.words) : (this._bm25 || this._buildBM25(targetText, opt.factorConfig.words)));
+    const bm25 = (targetsOverride
+      ? this._buildBM25(targetText, opt.factorConfig.words)
+      : (this._bm25 || this._buildBM25(targetText, opt.factorConfig.words))
+    );
 
-    // ============================================================
-    // SEMANTIC (Factor 7): embeddings + cosine in TFJS (batched)
-    // ============================================================
     const tSem0 = this._now();
     const semanticScores = await this._computeSemanticScores(query, qFeat, targetText, candIdx, opt);
     const msSemantic = this._now() - tSem0;
 
-    // ============================================================
-    // Non-semantic scoring + fusion
-    // ============================================================
     const tNon0 = this._now();
     const topK = Math.max(1, opt.perf.topK | 0);
     const best = [];
-
     const factorNames = this._factorNames();
-
-    // Optional time budget
     const budget = opt.perf.timeBudgetMs | 0;
 
-    // Candidate scoring loop
     for (let pos = 0; pos < candIdx.length; pos++) {
       const ti = candIdx[pos];
       const text = targetText[ti];
       const meta = targetMeta[ti] || null;
       const id = targetIds[ti] || null;
 
-      // Target features
       const tFeat = this._getTargetFeatures(text, ti, opt, targetsOverride ? true : false);
 
-      // 16 factor scores
       const scores = Object.create(null);
       const breakdown = Object.create(null);
 
-      // 1 numeric
+      // FAST factors
       scores.numericSimilarity = this._scoreNumeric(qFeat, tFeat, opt, breakdown);
-      // 2 alphabetic
-      scores.alphabeticSimilarity = this._scoreAlphabetic(qFeat, tFeat, opt, breakdown);
-      // 3 uppercase
-      scores.upperCasePatternSimilarity = this._scoreCasePattern(qFeat, tFeat, opt, breakdown, "upper");
-      // 4 lowercase
-      scores.lowerCasePatternSimilarity = this._scoreCasePattern(qFeat, tFeat, opt, breakdown, "lower");
-      // 5 spaces
-      scores.spacesSimilarity = this._scoreSpaces(qFeat, tFeat, opt, breakdown);
-      // 6 punctuation
-      scores.punctuationSimilarity = this._scorePunctuation(qFeat, tFeat, opt, breakdown);
-      // 7 semantic
+      scores.alphabeticSimilarity = this._scoreAlphabeticFast(qFeat, tFeat, opt, breakdown);
+      scores.upperCasePatternSimilarity = this._scoreCasePatternFast(qFeat, tFeat, opt, breakdown, "upper");
+      scores.lowerCasePatternSimilarity = this._scoreCasePatternFast(qFeat, tFeat, opt, breakdown, "lower");
+      scores.spacesSimilarity = this._scoreSpacesFast(qFeat, tFeat, opt, breakdown);
+      scores.punctuationSimilarity = this._scorePunctuationFast(qFeat, tFeat, opt, breakdown);
+
+      // semantic (hashed cosine)
       scores.humanMeaningSimilarity = semanticScores[pos] || 0;
       breakdown.humanMeaningSimilarity = {
         score01: scores.humanMeaningSimilarity,
         weightUsed: opt.factorWeights.humanMeaningSimilarity,
-        notes: "USE embedding cosine in TFJS mapped to [0,1]"
+        notes: "Hashed semantic cosine (no TF/USE)"
       };
-      // 8 words (BM25 + overlaps)
-      scores.wordsSimilarity = this._scoreWordsBM25(qFeat, tFeat, bm25, ti, opt, breakdown, targetText, targetsOverride);
-      // 9 no-grammar
-      scores.wordsSimilarityNoGrammar = this._scoreWordsNoGrammar(qFeat, tFeat, opt, breakdown);
-      // 10 grammar-sensitive
-      scores.wordsSimilarityWithGrammar = this._scoreWordsWithGrammar(qFeat, tFeat, opt, breakdown);
-      // 11 emoji
-      scores.emojiSimilarity = this._scoreEmoji(qFeat, tFeat, opt, breakdown);
-      // 12 first section
-      scores.firstSectionSimilarity = this._scoreSection(qFeat, tFeat, opt, breakdown, 1);
-      // 13 second section
-      scores.secondSectionSimilarity = this._scoreSection(qFeat, tFeat, opt, breakdown, 2);
-      // 14 grammar-follow
-      scores.followGrammarSimilarity = this._scoreGrammarFollow(qFeat, tFeat, opt, breakdown);
-      // 15 verb
-      scores.verbSimilarity = this._scoreVerbs(qFeat, tFeat, opt, breakdown);
-      // 16 aux
-      scores.auxiliaryVerbSimilarity = this._scoreAuxVerbs(qFeat, tFeat, opt, breakdown);
 
-      // Meta boost (importance-based, not time-based by default)
+      // tokens + bm25-lite
+      scores.wordsSimilarity = this._scoreWordsBM25Lite(qFeat, tFeat, bm25, ti, opt, breakdown, targetText, !!targetsOverride);
+
+      // no-grammar / grammar: cheap
+      scores.wordsSimilarityNoGrammar = this._scoreWordsNoGrammarFast(qFeat, tFeat, opt, breakdown);
+      scores.wordsSimilarityWithGrammar = this._scoreWordsWithGrammarFast(qFeat, tFeat, opt, breakdown);
+
+      // disabled heavy: neutral constants (still present)
+      scores.emojiSimilarity = 0.5; breakdown.emojiSimilarity = { score01: 0.5, weightUsed: opt.factorWeights.emojiSimilarity, notes: "Disabled (neutral)" };
+      scores.firstSectionSimilarity = this._scoreSectionFast(qFeat, tFeat, opt, breakdown, 1);
+      scores.secondSectionSimilarity = this._scoreSectionFast(qFeat, tFeat, opt, breakdown, 2);
+      scores.followGrammarSimilarity = 0.5; breakdown.followGrammarSimilarity = { score01: 0.5, weightUsed: opt.factorWeights.followGrammarSimilarity, notes: "Disabled (neutral)" };
+      scores.verbSimilarity = 0.5; breakdown.verbSimilarity = { score01: 0.5, weightUsed: opt.factorWeights.verbSimilarity, notes: "Disabled (neutral)" };
+      scores.auxiliaryVerbSimilarity = 0.5; breakdown.auxiliaryVerbSimilarity = { score01: 0.5, weightUsed: opt.factorWeights.auxiliaryVerbSimilarity, notes: "Disabled (neutral)" };
+
       const metaBoost = this._applyMetaBoost(opt, meta, text, ti, qFeat);
 
-      // Fuse
       const fused = this._fuseScores(scores, opt, factorNames);
       let score01 = fused.score01;
 
-      // Apply meta boost after fusion
       if (metaBoost) {
         const mult = (typeof metaBoost.multScore === "number") ? metaBoost.multScore : 1;
         const add = (typeof metaBoost.addScore01 === "number") ? metaBoost.addScore01 : 0;
         score01 = this._clamp01(score01 * mult + add);
       }
 
-      // Confidence
       const confidence01 = this._confidenceFromFactors(score01, scores, opt, factorNames);
 
-      // Diagnostics
       const diagnostics = {
         fused,
         metaBoost: metaBoost || undefined,
@@ -13606,7 +13445,6 @@ class UltraTextMatcherTF {
         meta: opt.meta.includeMetaInDiagnostics ? meta : undefined
       };
 
-      // Push into topK
       this._pushTopK(best, {
         text,
         index: ti,
@@ -13616,12 +13454,9 @@ class UltraTextMatcherTF {
         diagnostics
       }, topK);
 
-      // Micro yield
-      if (opt.perf.microYield.enabled && ((pos + 1) % (opt.perf.microYield.everyItems || 64) === 0)) {
+      if (opt.perf.microYield.enabled && ((pos + 1) % (opt.perf.microYield.everyItems || 256) === 0)) {
         await this._microYield(opt);
       }
-
-      // Budget stop
       if (budget > 0 && (this._now() - tStart) > budget) break;
     }
 
@@ -13629,30 +13464,17 @@ class UltraTextMatcherTF {
 
     const msNonSemantic = this._now() - tNon0;
     const msTotal = this._now() - tStart;
-    const tensorsAfter = this._safeNumTensors();
 
     if (opt.debug.enabled && opt.debug.logTimings) {
-      this._dInfo(opt, `match() targets=${candIdx.length}/${targetText.length} msTotal=${msTotal.toFixed(1)} msSem=${msSemantic.toFixed(1)} msNon=${msNonSemantic.toFixed(1)} tensors ${tensorsBefore}->${tensorsAfter}`);
+      this._dInfo(opt, `match() targets=${candIdx.length}/${targetText.length} msTotal=${msTotal.toFixed(1)} msSem=${msSemantic.toFixed(1)} msNon=${msNonSemantic.toFixed(1)}`);
     }
 
-    if (opt.debug.enabled && opt.debug.logTopK) {
-      const group = "UltraTextMatcherTF TopK";
-      if (opt.debug.groupCollapsed && console.groupCollapsed) console.groupCollapsed(group);
-      else if (console.group) console.group(group);
-      for (let i = 0; i < best.length; i++) {
-        console.log(i, best[i].score01, best[i].confidence01, best[i].text);
-      }
-      if (console.groupEnd) console.groupEnd();
-    }
-
-    // Auto-clear caches after match if requested
     if (opt.cache.autoClearAfterMatch) {
       if (opt.cache.clearFeatureCacheAfterMatch) this._featureCache.clear();
       if (opt.cache.clearEmbedCacheAfterMatch) this._embedLRUClear();
       if (opt.cache.clearQueryCacheAfterMatch) this._queryFeatureCache.clear();
     }
 
-    // Final formatting
     return {
       query,
       topK,
@@ -13668,17 +13490,15 @@ class UltraTextMatcherTF {
         msTotal: this._round3(msTotal),
         msSemantic: this._round3(msSemantic),
         msNonSemantic: this._round3(msNonSemantic),
-        backend,
-        tensorsBefore,
-        tensorsAfter,
+        backend: this._backend,
+        tensorsBefore: -1,
+        tensorsAfter: -1,
         numTargets: candIdx.length
       }
     };
   }
 
-  // =====================================================================
-  // SECTION C — Target normalization & resolution
-  // =====================================================================
+  /* ===================== TARGETS ===================== */
 
   _normalizeTargetItem(item) {
     if (typeof item === "string") return { text: item, meta: null, id: null };
@@ -13692,9 +13512,7 @@ class UltraTextMatcherTF {
   }
 
   _resolveTargets(targetsOverride) {
-    if (!targetsOverride) {
-      return { text: this._targetText, meta: this._targetMeta, ids: this._targetIds };
-    }
+    if (!targetsOverride) return { text: this._targetText, meta: this._targetMeta, ids: this._targetIds };
     const arr = Array.isArray(targetsOverride) ? targetsOverride : [];
     const text = new Array(arr.length);
     const meta = new Array(arr.length);
@@ -13708,7 +13526,7 @@ class UltraTextMatcherTF {
     return { text, meta, ids };
   }
 
-  _formatEmptyResult(query, opt, tStart, numTargets, backend, tensorsBefore) {
+  _formatEmptyResult(query, opt, tStart, numTargets, backend) {
     return {
       query,
       topK: Math.max(1, opt.perf.topK | 0),
@@ -13718,16 +13536,14 @@ class UltraTextMatcherTF {
         msSemantic: 0,
         msNonSemantic: 0,
         backend,
-        tensorsBefore,
-        tensorsAfter: this._safeNumTensors(),
+        tensorsBefore: -1,
+        tensorsAfter: -1,
         numTargets
       }
     };
   }
 
-  // =====================================================================
-  // SECTION D — Metadata filter & boost (no time/recency default)
-  // =====================================================================
+  /* ===================== META FILTER/BOOST (same behavior) ===================== */
 
   _applyMetaFilterIndices(opt, targetText, targetMeta) {
     if (!opt.meta.enabled || !opt.meta.filter) {
@@ -13745,16 +13561,13 @@ class UltraTextMatcherTF {
           if (f(targetMeta[i] || null, targetText[i], i)) out.push(i);
         } catch (e) {
           if (opt.debug.logWarnings) this._dWarn(opt, "meta.filter error:", e);
-          // Fail-open
           out.push(i);
         }
       }
       return out;
     }
 
-    // Object rules
     const rules = f || {};
-
     const allowTags = Array.isArray(rules.allowTags) ? new Set(rules.allowTags.map(String)) : null;
     const blockTags = Array.isArray(rules.blockTags) ? new Set(rules.blockTags.map(String)) : null;
     const allowAnyTags = Array.isArray(rules.allowAnyTags) ? new Set(rules.allowAnyTags.map(String)) : null;
@@ -13778,7 +13591,6 @@ class UltraTextMatcherTF {
       const m = targetMeta[i] || {};
       let ok = true;
 
-      // Required fields
       if (ok && requireFields && requireFields.length) {
         for (let k = 0; k < requireFields.length; k++) {
           const fld = requireFields[k];
@@ -13786,20 +13598,16 @@ class UltraTextMatcherTF {
         }
       }
 
-      // Types
       const ty = String(m.type ?? m.kind ?? "");
       if (ok && allowTypes && allowTypes.size && !allowTypes.has(ty)) ok = false;
       if (ok && blockTypes && blockTypes.size && blockTypes.has(ty)) ok = false;
 
-      // Channels
       const ch = String(m.channel ?? m.room ?? m.source ?? "");
       if (ok && allowChannels && allowChannels.size && !allowChannels.has(ch)) ok = false;
       if (ok && blockChannels && blockChannels.size && blockChannels.has(ch)) ok = false;
 
-      // Tags
       const tags = Array.isArray(m.tags) ? m.tags.map(String) : [];
       if (ok && allowTags && allowTags.size) {
-        // must contain all allowTags
         for (const t of allowTags) {
           if (!tags.includes(t)) { ok = false; break; }
         }
@@ -13810,19 +13618,16 @@ class UltraTextMatcherTF {
         }
       }
       if (ok && allowAnyTags && allowAnyTags.size) {
-        // must contain at least one
         let any = false;
         for (const t of allowAnyTags) { if (tags.includes(t)) { any = true; break; } }
         if (!any) ok = false;
       }
       if (ok && blockAnyTags && blockAnyTags.size) {
-        // if contains any => block
         let any = false;
         for (const t of blockAnyTags) { if (tags.includes(t)) { any = true; break; } }
         if (any) ok = false;
       }
 
-      // Priority & quality
       const pr = (typeof m.priority === "number") ? m.priority : (typeof m.rank === "number" ? m.rank : (typeof m.weight === "number" ? m.weight : NaN));
       const ql = (typeof m.quality === "number") ? m.quality : (typeof m.score === "number" ? m.score : NaN);
 
@@ -13835,38 +13640,26 @@ class UltraTextMatcherTF {
 
       if (ok) out.push(i);
     }
-
     return out;
   }
 
   _applyMetaBoost(opt, meta, text, index, qFeat) {
     if (!opt.meta.enabled || !opt.meta.boost) return null;
-
     const b = opt.meta.boost;
 
-    // function mode
     if (typeof b === "function") {
-      try {
-        return b(meta, text, index, qFeat) || null;
-      } catch (e) {
-        if (opt.debug.logWarnings) this._dWarn(opt, "meta.boost error:", e);
-        return null;
-      }
+      try { return b(meta, text, index, qFeat) || null; }
+      catch (e) { if (opt.debug.logWarnings) this._dWarn(opt, "meta.boost error:", e); return null; }
     }
 
-    // object rules
     const rules = b || {};
     let add = 0;
     let mult = 1;
     const notes = [];
-
     const m = meta || {};
 
-    // Importance-based boost (NO time-based by default)
-    // importanceField: auto | specific
     const field = rules.importanceField || "auto";
     let imp = NaN;
-
     if (field === "auto") {
       if (typeof m.priority === "number") imp = m.priority;
       else if (typeof m.rank === "number") imp = m.rank;
@@ -13882,11 +13675,9 @@ class UltraTextMatcherTF {
       const mode = rules.importanceMode || "sigmoid";
       let v = 0;
       if (mode === "linear") {
-        // assume imp ~ 0..1 or 0..10; normalize robustly
         const norm = this._clamp01(imp > 1 ? (imp / 10) : imp);
-        v = scale * (norm - 0.5) * 2; // -scale..+scale
+        v = scale * (norm - 0.5) * 2;
       } else {
-        // sigmoid centered at 0.5 (if imp 0..1) or 5 (if imp 0..10)
         const x = (imp > 1) ? (imp - 5) : ((imp - 0.5) * 10);
         const s = 1 / (1 + Math.exp(-x));
         v = scale * (s - 0.5) * 2;
@@ -13895,54 +13686,36 @@ class UltraTextMatcherTF {
       notes.push(`importance(${field})=${imp} add=${v.toFixed(4)}`);
     }
 
-    // tag boosts
     if (rules.tagBoost && Array.isArray(m.tags)) {
       for (let i = 0; i < m.tags.length; i++) {
         const tg = String(m.tags[i]);
         const val = rules.tagBoost[tg];
-        if (typeof val === "number" && val !== 0) {
-          add += val;
-          notes.push(`tagBoost(${tg})=${val}`);
-        }
+        if (typeof val === "number" && val !== 0) { add += val; notes.push(`tagBoost(${tg})=${val}`); }
       }
     }
 
-    // type boosts
     const ty = String(m.type ?? m.kind ?? "");
     if (rules.typeBoost && ty) {
       const val = rules.typeBoost[ty];
-      if (typeof val === "number" && val !== 0) {
-        add += val;
-        notes.push(`typeBoost(${ty})=${val}`);
-      }
+      if (typeof val === "number" && val !== 0) { add += val; notes.push(`typeBoost(${ty})=${val}`); }
     }
 
-    // channel boosts
     const ch = String(m.channel ?? m.room ?? m.source ?? "");
     if (rules.channelBoost && ch) {
       const val = rules.channelBoost[ch];
-      if (typeof val === "number" && val !== 0) {
-        add += val;
-        notes.push(`channelBoost(${ch})=${val}`);
-      }
+      if (typeof val === "number" && val !== 0) { add += val; notes.push(`channelBoost(${ch})=${val}`); }
     }
 
-    // author boosts
     const au = String(m.author ?? m.user ?? m.owner ?? "");
     if (rules.authorBoost && au) {
       const val = rules.authorBoost[au];
-      if (typeof val === "number" && val !== 0) {
-        add += val;
-        notes.push(`authorBoost(${au})=${val}`);
-      }
+      if (typeof val === "number" && val !== 0) { add += val; notes.push(`authorBoost(${au})=${val}`); }
     }
 
-    // Optional query-tag affinity (#tag in query)
     if (qFeat && qFeat.hashTags && qFeat.hashTags.size && Array.isArray(m.tags)) {
       let hits = 0;
-      for (const ht of qFeat.hashTags) {
-        if (m.tags.map((x) => String(x).toLowerCase()).includes(ht)) hits++;
-      }
+      const mt = m.tags.map((x) => String(x).toLowerCase());
+      for (const ht of qFeat.hashTags) if (mt.includes(ht)) hits++;
       if (hits > 0) {
         const extra = Math.min(0.10, 0.02 * hits);
         add += extra;
@@ -13950,7 +13723,6 @@ class UltraTextMatcherTF {
       }
     }
 
-    // Clamp
     const clampAdd = (typeof rules.clampAdd === "number") ? rules.clampAdd : 0.25;
     const minM = (typeof rules.clampMultMin === "number") ? rules.clampMultMin : 0.70;
     const maxM = (typeof rules.clampMultMax === "number") ? rules.clampMultMax : 1.35;
@@ -13962,9 +13734,7 @@ class UltraTextMatcherTF {
     return { addScore01: add, multScore: mult, notes: notes.join("; ") };
   }
 
-  // =====================================================================
-  // SECTION E — Feature extraction & caching
-  // =====================================================================
+  /* ===================== FEATURES ===================== */
 
   _tKey(i) { return "T:" + i; }
   _qKey(q) { return "Q:" + q; }
@@ -13982,15 +13752,12 @@ class UltraTextMatcherTF {
   }
 
   _getTargetFeatures(text, index, opt, isOverrideTargets) {
-    // If override targets are passed, indices don't map to global cache safely.
     if (isOverrideTargets || !opt.cache.featureCache) {
       return this._extractFeatures(text, opt, false);
     }
-
     const k = this._tKey(index);
     const hit = this._featureCache.get(k);
     if (hit) return hit;
-
     const feat = this._extractFeatures(text, opt, false);
     this._featureCache.set(k, feat);
     return feat;
@@ -13998,56 +13765,47 @@ class UltraTextMatcherTF {
 
   _extractFeatures(text, opt, isQuery) {
     const raw = String(text ?? "");
-    const len = raw.length;
-
-    // normalized strings
     const lower = raw.toLowerCase();
     const collapsedSpaces = raw.replace(/\s+/g, " ").trim();
     const alphaOnly = lower.replace(/[^a-z]+/g, "");
 
-    // numbers
     const nums = this._extractNumbers(raw, opt.factorConfig.numeric.maxNumbers);
 
-    // case patterns
-    const caseInfo = this._extractCasePattern(raw, opt.factorConfig.casePattern.bins);
+    // FAST: case ratio only (no bin scan)
+    const caseInfo = this._extractCaseRatioFast(raw);
 
-    // spaces
-    const spacesInfo = this._extractSpacesPattern(raw, opt.factorConfig.spaces);
+    // FAST: spaces count only
+    const spacesInfo = { spaceCount: (raw.match(/\s/g) || []).length, runs: [], posBins: [] };
 
-    // punctuation
-    const punctInfo = this._extractPunctuation(raw, opt.factorConfig.punctuation);
+    // FAST: punctuation density + set (no positions)
+    const punct = raw.match(/[.,;:!?'"(){}\[\]\-_/\\@#$%^&*+=<>`~|]/g) || [];
+    const punctInfo = { list: punct, set: new Set(punct), density: raw.length ? (punct.length / raw.length) : 0, posBins: [] };
 
-    // emoji
-    const emojiInfo = this._extractEmoji(raw, opt.factorConfig.emoji);
+    // emoji disabled
+    const emojiInfo = { list: [], set: new Set(), posBins: [] };
 
-    // tokens
     const tokens = this._tokenizeEnglish(raw, opt.factorConfig.words);
     const tokenSet = new Set(tokens);
 
-    // token ngrams
-    const tokenBigrams = this._tokenNGrams(tokens, opt.factorConfig.words.tokenGramN, opt.factorConfig.words.maxTokenGrams);
-    const tokenBigramSet = new Set(tokenBigrams);
+    // bigrams disabled for speed (keep empty sets so code never breaks)
+    const tokenBigrams = [];
+    const tokenBigramSet = new Set();
 
-    // no-grammar tokens
     const tokensNoGrammar = tokens.map((t) => this._stripSuffixes(t, opt.factorConfig.nogrammar));
     const tokenNGSet = new Set(tokensNoGrammar);
 
-    // verbs/aux
-    const verbs = this._extractVerbs(tokens, opt.factorConfig.verbs);
-    const aux = this._extractAuxVerbs(tokens, opt.factorConfig.aux);
-
-    // sections
     const sections = this._extractSections(raw, opt.factorConfig.sections);
 
-    // grammar heuristics
-    const grammarFeat = this._extractGrammarHeuristics(raw, tokens, opt.factorConfig.grammar);
+    // grammar/verbs/aux disabled (safe placeholders)
+    const grammarFeat = { sentenceLenHist: [], punctPatternSet: new Set(), functionWordSet: new Set(), clauseMarkersSet: new Set(), svoTriplesSet: new Set() };
+    const verbs = { set: new Set(), posBins: [] };
+    const aux = { set: new Set(), posBins: [] };
 
-    // char ngrams (alphabetic)
+    // char ngrams (small cap)
     const charN = opt.factorConfig.alphabetic.charNGramN;
     const charNGrams = this._charNGrams(alphaOnly, charN, opt.factorConfig.alphabetic.charNGramMax);
     const charNGramSet = new Set(charNGrams);
 
-    // hashtags (query only)
     let hashTags = null;
     if (isQuery) {
       hashTags = new Set();
@@ -14056,259 +13814,109 @@ class UltraTextMatcherTF {
     }
 
     return {
-      raw,
-      len,
-      lower,
-      collapsedSpaces,
-      alphaOnly,
-      nums,
-      caseInfo,
-      spacesInfo,
-      punctInfo,
-      emojiInfo,
-      tokens,
-      tokenSet,
-      tokenBigrams,
-      tokenBigramSet,
-      tokensNoGrammar,
-      tokenNGSet,
-      verbs,
-      aux,
-      sections,
-      grammarFeat,
-      charNGrams,
-      charNGramSet,
+      raw, lower, collapsedSpaces, alphaOnly, nums,
+      caseInfo, spacesInfo, punctInfo, emojiInfo,
+      tokens, tokenSet, tokenBigrams, tokenBigramSet,
+      tokensNoGrammar, tokenNGSet,
+      verbs, aux, sections, grammarFeat,
+      charNGrams, charNGramSet,
       hashTags
     };
   }
 
-  // =====================================================================
-  // SECTION F — Semantic computation (fixed tidy usage)
-  // =====================================================================
+  _extractCaseRatioFast(raw) {
+    let upper = 0, lower = 0;
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw.charCodeAt(i);
+      if (c >= 65 && c <= 90) upper++;
+      else if (c >= 97 && c <= 122) lower++;
+    }
+    const L = raw.length || 1;
+    return {
+      upper, lower,
+      upperRatio: upper / L,
+      lowerRatio: lower / L,
+      upperBins: [],
+      lowerBins: []
+    };
+  }
+
+  /* ===================== SEMANTIC (FAST HASHED) ===================== */
 
   async _computeSemanticScores(query, qFeat, targetText, candIdx, opt) {
-  opt.perf = opt.perf || {};
-  opt.perf.microYield = opt.perf.microYield || { enabled: false, everyItems: 64, strategy: "timeout0" };
-
-
-  // ...rest of your function
-    const batchSize = Math.max(1, opt.perf.semanticBatchSize | 0);
     const scores = new Float32Array(candIdx.length);
 
-    // Query vector (try cache)
+    // Query vector (LRU)
     const qKey = this._eKey(query, opt);
     let qVec = opt.cache.embeddingCache ? this._embedLRUGet(qKey) : null;
 
     if (!qVec) {
-      const qVecs = await this._embedTextsToVectors([query], opt);
-      qVec = qVecs[0] || new Float32Array(0);
+      qVec = this._hashEmbeddingVector(query, opt.factorConfig.semantic.hashDims || 256, opt.factorConfig.words);
       if (opt.cache.embeddingCache && qVec.length) this._embedLRUSet(qKey, qVec, opt);
     }
 
-    if (!qVec || qVec.length === 0) {
-      // semantic scores remain 0
-      return scores;
+    if (!qVec || qVec.length === 0) return scores;
+
+    const floor = opt.factorConfig.semantic.enableFloor ? opt.factorConfig.semantic.cosineFloor : -1.0;
+
+    // batch loop (pure JS)
+    for (let i = 0; i < candIdx.length; i++) {
+      const idx = candIdx[i];
+      const text = targetText[idx];
+      const k = this._eKey(text, opt);
+      let v = opt.cache.embeddingCache ? this._embedLRUGet(k) : null;
+      if (!v) {
+        v = this._hashEmbeddingVector(text, opt.factorConfig.semantic.hashDims || 256, opt.factorConfig.words);
+        if (opt.cache.embeddingCache && v.length) this._embedLRUSet(k, v, opt);
+      }
+
+      const c = this._cosineDense(qVec, v);
+      let s01 = (c - floor) / (1 - floor);
+      if (s01 < 0) s01 = 0;
+      if (s01 > 1) s01 = 1;
+      scores[i] = s01;
+
+      if (opt.perf.microYield.enabled && ((i + 1) % (opt.perf.microYield.everyItems || 256) === 0)) {
+        await this._microYield(opt);
+      }
     }
-
-    for (let bi = 0; bi < candIdx.length; bi += batchSize) {
-      const end = Math.min(candIdx.length, bi + batchSize);
-      const n = end - bi;
-
-      // Prepare batch vecs via cache or embed
-      const vecs = new Array(n);
-      const keys = new Array(n);
-      const needTexts = [];
-      const needPos = [];
-
-      for (let j = 0; j < n; j++) {
-        const idx = candIdx[bi + j];
-        const text = targetText[idx];
-        const k = this._eKey(text, opt);
-        keys[j] = k;
-        let v = opt.cache.embeddingCache ? this._embedLRUGet(k) : null;
-        if (!v) {
-          needTexts.push(text);
-          needPos.push(j);
-          vecs[j] = null;
-        } else {
-          vecs[j] = v;
-        }
-      }
-
-      if (needTexts.length) {
-        const newVecs = await this._embedTextsToVectors(needTexts, opt);
-        for (let k = 0; k < needPos.length; k++) {
-          const j = needPos[k];
-          const v = newVecs[k] || new Float32Array(0);
-          vecs[j] = v;
-          if (opt.cache.embeddingCache && v.length) this._embedLRUSet(keys[j], v, opt);
-        }
-      }
-
-      // Cosine in TFJS (tidy is synchronous, await data outside)
-      const cos = await this._cosineSimilarityTFJS(qVec, vecs);
-
-      // Map cosine to [0,1]
-      const cfg = opt.factorConfig.semantic;
-      const floor = cfg.enableFloor ? cfg.cosineFloor : -1.0;
-
-      for (let j = 0; j < n; j++) {
-        const c = cos[j];
-        let s01 = (c - floor) / (1 - floor);
-        if (s01 < 0) s01 = 0;
-        if (s01 > 1) s01 = 1;
-        scores[bi + j] = s01;
-      }
-
-      if (opt.debug.enabled && opt.debug.logBatches) {
-        this._dInfo(opt, `semantic batch ${bi}..${end} (n=${n})`);
-      }
-
-    const my = opt?.perf?.microYield;
-    if (my?.enabled) {
-    await this._microYield(opt);
-    }
-    }
-
     return scores;
   }
 
-  async _warmupModel(opt) {
-    // Warmup embedding + cosine to compile common kernels
-    const dummy = ["Warmup sentence one.", "Warmup sentence two."];
-    const vecs = await this._embedTextsToVectors(dummy, opt);
-    const q = vecs[0] || new Float32Array(0);
-    const A = [vecs[1] || new Float32Array(0)];
-    if (q.length && A[0].length) {
-      await this._cosineSimilarityTFJS(q, A);
-    }
-  }
+  _hashEmbeddingVector(text, dims, wordsCfg) {
+    // very fast hashed bag-of-words (dense small vector)
+    const tokens = this._tokenizeEnglish(text, wordsCfg);
+    if (!tokens.length) return new Float32Array(dims);
 
-  async _embedTextsToVectors(texts, opt) {
-    // IMPORTANT: No tf.tidy around async
-    if (!this._model || typeof this._model.embed !== "function") {
-      return texts.map(() => new Float32Array(0));
+    const v = new Float32Array(dims);
+    for (let i = 0; i < tokens.length; i++) {
+      const h = this._fnv1a32(tokens[i]);
+      const idx = h & (dims - 1); // dims should be power of 2 (256 default)
+      v[idx] += 1;
     }
 
-    // Embed
-    const emb = await this._model.embed(texts); // Tensor2D [n,d]
-    try {
-      // Prefer data() then slice, to avoid huge nested arrays
-      // But we need per-row vectors. We'll use array() safely for moderate batch sizes.
-      const arr = await emb.array();
-      const out = new Array(arr.length);
-      for (let i = 0; i < arr.length; i++) {
-        out[i] = Float32Array.from(arr[i]);
-      }
-      return out;
-    } finally {
-      // Always dispose tensor
-      emb.dispose();
-    }
+    // L2 normalize
+    let norm = 0;
+    for (let i = 0; i < dims; i++) norm += v[i] * v[i];
+    norm = Math.sqrt(norm) + 1e-12;
+    for (let i = 0; i < dims; i++) v[i] = v[i] / norm;
+
+    return v;
   }
 
-  async _cosineSimilarityTFJS(qVec, batchVecs) {
-    const n = batchVecs.length;
-    const d = qVec.length;
-    if (n === 0) return new Float32Array(0);
-    if (d === 0) return new Float32Array(n);
-
-    // Create sim tensor via tidy (sync), then await data outside
-    const simTensor = tf.tidy(() => {
-      const q = tf.tensor2d(qVec, [1, d], "float32");           // [1,d]
-      const A = tf.tensor2d(this._stackVecs(batchVecs, d), [n, d], "float32"); // [n,d]
-
-      // norms
-      const qNorm = tf.norm(q, "euclidean", 1).add(1e-12);      // [1]
-      const ANorm = tf.norm(A, "euclidean", 1).add(1e-12);      // [n]
-
-      // unit vectors
-      const qUnit = q.div(qNorm.reshape([1, 1]));               // [1,d]
-      const AUnit = A.div(ANorm.reshape([n, 1]));               // [n,d]
-
-      // cosine
-      const sim = AUnit.mul(qUnit).sum(1);                      // [n]
-
-      // Return sim; tidy will dispose intermediates except returned tensor
-      return sim;
-    });
-
-    try {
-      const out = await simTensor.data(); // await outside tidy
-      return out;
-    } finally {
-      simTensor.dispose();
-    }
+  _cosineDense(a, b) {
+    const n = Math.min(a.length, b.length);
+    let dot = 0;
+    for (let i = 0; i < n; i++) dot += a[i] * b[i];
+    // vectors are normalized already => dot is cosine
+    // but handle accidental zeros:
+    if (!Number.isFinite(dot)) return 0;
+    if (dot > 1) dot = 1;
+    if (dot < -1) dot = -1;
+    return dot;
   }
 
-  _stackVecs(vecs, d) {
-    const n = vecs.length;
-    const out = new Float32Array(n * d);
-    for (let i = 0; i < n; i++) {
-      const v = vecs[i] || new Float32Array(0);
-      const off = i * d;
-      const m = Math.min(d, v.length);
-      for (let j = 0; j < m; j++) out[off + j] = v[j];
-    }
-    return out;
-  }
-
-  // =====================================================================
-  // SECTION G — Embedding LRU (Float32Array)
-  // =====================================================================
-
-  _eKey(text, opt) {
-    if (opt.cache.embeddingCacheKey === "hash") return "E:" + this._hash32(text);
-    return "E:" + text;
-  }
-
-  _embedLRUGet(key) {
-    const e = this._embedLRU.get(key);
-    if (!e) return null;
-    e.lastUsed = this._now();
-    return e.vec;
-  }
-
-  _embedLRUSet(key, vec, opt) {
-    const limitBytes = Math.max(1, (opt.cache.embeddingCacheLimitMB || 128) * 1024 * 1024);
-    const bytes = vec.byteLength || (vec.length * 4);
-
-    // Replace existing
-    const ex = this._embedLRU.get(key);
-    if (ex) {
-      this._embedLRUBytes -= ex.bytes || 0;
-      this._embedLRU.delete(key);
-    }
-
-    this._embedLRU.set(key, { vec, dim: vec.length, bytes, lastUsed: this._now() });
-    this._embedLRUBytes += bytes;
-
-    // Evict if needed
-    if (this._embedLRUBytes > limitBytes) this._embedLRUEvict(limitBytes, opt);
-  }
-
-  _embedLRUEvict(limitBytes, opt) {
-    const arr = Array.from(this._embedLRU.entries());
-    arr.sort((a, b) => (a[1].lastUsed - b[1].lastUsed));
-    for (let i = 0; i < arr.length && this._embedLRUBytes > limitBytes; i++) {
-      const key = arr[i][0];
-      const ent = arr[i][1];
-      this._embedLRU.delete(key);
-      this._embedLRUBytes -= ent.bytes || 0;
-    }
-    if (opt.debug.enabled && opt.debug.logCache) {
-      this._dInfo(opt, `embedLRU evicted, bytes=${this._embedLRUBytes}`);
-    }
-  }
-
-  _embedLRUClear() {
-    this._embedLRU.clear();
-    this._embedLRUBytes = 0;
-  }
-
-  // =====================================================================
-  // SECTION H — Factor list
-  // =====================================================================
+  /* ===================== FACTORS ===================== */
 
   _factorNames() {
     return [
@@ -14331,13 +13939,9 @@ class UltraTextMatcherTF {
     ];
   }
 
-  // =====================================================================
-  // SECTION I — Factor 1: Numeric similarity
-  // =====================================================================
-
+  // 1 Numeric (same as before, but maxNumbers smaller)
   _scoreNumeric(q, t, opt, breakdown) {
     const w = opt.factorWeights.numericSimilarity;
-
     const qn = q.nums;
     const tn = t.nums;
 
@@ -14352,10 +13956,8 @@ class UltraTextMatcherTF {
       return s;
     }
 
-    // Set overlap on normalized number strings
     const setOverlap = this._jaccardSet(qn.normSet, tn.normSet);
 
-    // Relative closeness: each query number best matches any target number
     let closeness = 0;
     const alpha = opt.factorConfig.numeric.closenessAlpha;
     for (let i = 0; i < qn.values.length; i++) {
@@ -14370,8 +13972,7 @@ class UltraTextMatcherTF {
     }
     closeness /= Math.max(1, qn.values.length);
 
-    // Blend
-    const score = this._clamp01(0.55 * setOverlap + 0.45 * (alpha * closeness + (1 - alpha) * Math.sqrt(closeness)));
+    const score = this._clamp01(0.60 * setOverlap + 0.40 * (alpha * closeness + (1 - alpha) * Math.sqrt(closeness)));
 
     breakdown.numericSimilarity = {
       score01: score,
@@ -14381,11 +13982,8 @@ class UltraTextMatcherTF {
     return score;
   }
 
-  // =====================================================================
-  // SECTION J — Factor 2: Alphabetic similarity
-  // =====================================================================
-
-  _scoreAlphabetic(q, t, opt, breakdown) {
+  // 2 Alphabetic: FAST char-ngrams only (no edit distance)
+  _scoreAlphabeticFast(q, t, opt, breakdown) {
     const w = opt.factorWeights.alphabeticSimilarity;
 
     const qa = q.alphaOnly;
@@ -14402,385 +14000,121 @@ class UltraTextMatcherTF {
       return s;
     }
 
-    const ngramJac = this._jaccardSet(q.charNGramSet, t.charNGramSet);
+    const jac = this._jaccardSet(q.charNGramSet, t.charNGramSet);
 
-    // Edit similarity with cap
-    const maxLen = opt.factorConfig.alphabetic.editDistanceMaxLen;
-    const levSim = (qa.length <= maxLen && ta.length <= maxLen) ? this._levenshteinSim01(qa, ta) : this._approxEditSimLong(qa, ta);
+    // small prefix bonus (cheap)
+    const pre = this._prefixSim01(qa, ta, 18);
+    const score = this._clamp01(0.78 * jac + 0.22 * pre);
 
-    const score = this._clamp01(0.62 * ngramJac + 0.38 * levSim);
-
-    breakdown.alphabeticSimilarity = {
-      score01: score,
-      weightUsed: w,
-      notes: `charNGramJaccard=${ngramJac.toFixed(3)} editSim=${levSim.toFixed(3)}`
-    };
+    breakdown.alphabeticSimilarity = { score01: score, weightUsed: w, notes: `charNGramJaccard=${jac.toFixed(3)} pre=${pre.toFixed(3)}` };
     return score;
   }
 
-  // =====================================================================
-  // SECTION K — Factor 3 & 4: Case pattern similarity
-  // =====================================================================
-
-  _scoreCasePattern(q, t, opt, breakdown, mode) {
+  // 3/4 Case pattern: ratio only
+  _scoreCasePatternFast(q, t, opt, breakdown, mode) {
     const name = (mode === "upper") ? "upperCasePatternSimilarity" : "lowerCasePatternSimilarity";
     const w = opt.factorWeights[name];
-
-    // Focus multiplier for case
     const caseMul = this._clampFocus(opt.focus.favorCase);
 
-    const qc = q.caseInfo;
-    const tc = t.caseInfo;
+    const qRatio = (mode === "upper") ? q.caseInfo.upperRatio : q.caseInfo.lowerRatio;
+    const tRatio = (mode === "upper") ? t.caseInfo.upperRatio : t.caseInfo.lowerRatio;
 
-    const qRatio = (mode === "upper") ? qc.upperRatio : qc.lowerRatio;
-    const tRatio = (mode === "upper") ? tc.upperRatio : tc.lowerRatio;
-
-    const ratioSim = 1 - Math.min(1, Math.abs(qRatio - tRatio) / 0.45);
-    const posSim = this._binPatternSim((mode === "upper") ? qc.upperBins : qc.lowerBins, (mode === "upper") ? tc.upperBins : tc.lowerBins);
-
-    const score = this._clamp01((0.55 * ratioSim + 0.45 * posSim) * caseMul);
-
-    breakdown[name] = {
-      score01: score,
-      weightUsed: w,
-      notes: `ratioSim=${ratioSim.toFixed(3)} posSim=${posSim.toFixed(3)} caseMul=${caseMul.toFixed(2)}`
-    };
+    const score = this._clamp01((1 - Math.min(1, Math.abs(qRatio - tRatio) / 0.40)) * caseMul);
+    breakdown[name] = { score01: score, weightUsed: w, notes: `ratioSim=${score.toFixed(3)} caseMul=${caseMul.toFixed(2)}` };
     return score;
   }
 
-  // =====================================================================
-  // SECTION L — Factor 5: Spaces similarity
-  // =====================================================================
-
-  _scoreSpaces(q, t, opt, breakdown) {
+  // 5 Spaces: count only
+  _scoreSpacesFast(q, t, opt, breakdown) {
     const w = opt.factorWeights.spacesSimilarity;
-
-    const qs = q.spacesInfo;
-    const ts = t.spacesInfo;
-
-    const maxCount = Math.max(1, Math.max(qs.spaceCount, ts.spaceCount));
-    const countSim = 1 - Math.min(1, Math.abs(qs.spaceCount - ts.spaceCount) / maxCount);
-
-    // run length similarity (set-like)
-    const runSim = this._jaccardArr(qs.runs, ts.runs);
-
-    // positions bins similarity
-    const posSim = this._binPatternSim(qs.posBins, ts.posBins);
-
-    // collapsed string similarity
-    const colSim = this._levenshteinSim01(q.collapsedSpaces.toLowerCase(), t.collapsedSpaces.toLowerCase());
-
-    const score = this._clamp01(0.30 * countSim + 0.25 * runSim + 0.20 * posSim + 0.25 * colSim);
-
-    breakdown.spacesSimilarity = {
-      score01: score,
-      weightUsed: w,
-      notes: `countSim=${countSim.toFixed(3)} runSim=${runSim.toFixed(3)} posSim=${posSim.toFixed(3)} colSim=${colSim.toFixed(3)}`
-    };
+    const a = q.spacesInfo.spaceCount || 0;
+    const b = t.spacesInfo.spaceCount || 0;
+    const max = Math.max(1, a, b);
+    const score = this._clamp01(1 - Math.min(1, Math.abs(a - b) / max));
+    breakdown.spacesSimilarity = { score01: score, weightUsed: w, notes: `spaceCountSim=${score.toFixed(3)}` };
     return score;
   }
 
-  // =====================================================================
-  // SECTION M — Factor 6: Punctuation similarity
-  // =====================================================================
-
-  _scorePunctuation(q, t, opt, breakdown) {
+  // 6 Punctuation: set overlap + density
+  _scorePunctuationFast(q, t, opt, breakdown) {
     const w = opt.factorWeights.punctuationSimilarity;
-
-    const qp = q.punctInfo;
-    const tp = t.punctInfo;
-
-    const setSim = this._jaccardSet(qp.set, tp.set);
-    const posSim = this._binPatternSim(qp.posBins, tp.posBins);
-
-    const densSim = 1 - Math.min(1, Math.abs(qp.density - tp.density) / 0.12);
-
-    // Focus multiplier for punctuation
     const punctMul = this._clampFocus(opt.focus.favorPunctuation);
 
-    const score = this._clamp01((0.48 * setSim + 0.32 * posSim + 0.20 * densSim) * punctMul);
+    const setSim = this._jaccardSet(q.punctInfo.set, t.punctInfo.set);
+    const densSim = 1 - Math.min(1, Math.abs((q.punctInfo.density || 0) - (t.punctInfo.density || 0)) / 0.10);
 
-    breakdown.punctuationSimilarity = {
-      score01: score,
-      weightUsed: w,
-      notes: `setSim=${setSim.toFixed(3)} posSim=${posSim.toFixed(3)} densSim=${densSim.toFixed(3)} punctMul=${punctMul.toFixed(2)}`
-    };
+    const score = this._clamp01((0.60 * setSim + 0.40 * densSim) * punctMul);
+    breakdown.punctuationSimilarity = { score01: score, weightUsed: w, notes: `setSim=${setSim.toFixed(3)} densSim=${densSim.toFixed(3)} punctMul=${punctMul.toFixed(2)}` };
     return score;
   }
 
-  // =====================================================================
-  // SECTION N — Factor 8: Words similarity (Jaccard + n-grams + BM25)
-  // =====================================================================
-
-  _scoreWordsBM25(q, t, bm25, docIndex, opt, breakdown, targetText, isOverrideTargets) {
+  // 8 Words similarity: BM25-lite + jaccard (no bigrams)
+  _scoreWordsBM25Lite(q, t, bm25, docIndex, opt, breakdown, targetText, isOverrideTargets) {
     const w = opt.factorWeights.wordsSimilarity;
 
-    // Token overlap
     const jac = this._jaccardSet(q.tokenSet, t.tokenSet);
-
-    // Token bigram overlap
-    const gramJac = this._jaccardSet(q.tokenBigramSet, t.tokenBigramSet);
-
-    // BM25
     const bm = this._bm25Score(q.tokens, docIndex, bm25, opt.factorConfig.words.bm25, targetText, isOverrideTargets, opt);
-    const bm01 = 1 - Math.exp(-0.55 * bm);
+    const bm01 = 1 - Math.exp(-0.60 * bm);
 
-    // Focus for tokens
     const tokMul = this._clampFocus(opt.focus.favorTokens);
 
-    const score = this._clamp01((0.30 * jac + 0.22 * gramJac + 0.48 * bm01) * tokMul);
+    const score = this._clamp01((0.42 * jac + 0.58 * bm01) * tokMul);
 
     breakdown.wordsSimilarity = {
       score01: score,
       weightUsed: w,
-      notes: `tokenJaccard=${jac.toFixed(3)} bigramJaccard=${gramJac.toFixed(3)} bm25=${bm.toFixed(3)} bm01=${bm01.toFixed(3)} tokMul=${tokMul.toFixed(2)}`
+      notes: `tokenJaccard=${jac.toFixed(3)} bm25=${bm.toFixed(3)} bm01=${bm01.toFixed(3)} tokMul=${tokMul.toFixed(2)}`
     };
     return score;
   }
 
-  // =====================================================================
-  // SECTION O — Factor 9: Words similarity without grammar
-  // =====================================================================
-
-  _scoreWordsNoGrammar(q, t, opt, breakdown) {
+  // 9 No-grammar: stripped token jaccard only
+  _scoreWordsNoGrammarFast(q, t, opt, breakdown) {
     const w = opt.factorWeights.wordsSimilarityNoGrammar;
-
     const jac = this._jaccardSet(q.tokenNGSet, t.tokenNGSet);
-
-    // normalized bigrams on stripped tokens
-    const qArr = Array.from(q.tokenNGSet);
-    const tArr = Array.from(t.tokenNGSet);
-    const qG = new Set(this._tokenNGrams(qArr, 2, 2048));
-    const tG = new Set(this._tokenNGrams(tArr, 2, 2048));
-    const gramJac = this._jaccardSet(qG, tG);
-
-    const score = this._clamp01(0.62 * jac + 0.38 * gramJac);
-
-    breakdown.wordsSimilarityNoGrammar = {
-      score01: score,
-      weightUsed: w,
-      notes: `jac=${jac.toFixed(3)} gramJac=${gramJac.toFixed(3)}`
-    };
-    return score;
+    breakdown.wordsSimilarityNoGrammar = { score01: jac, weightUsed: w, notes: `strippedTokenJaccard=${jac.toFixed(3)}` };
+    return jac;
   }
 
-  // =====================================================================
-  // SECTION P — Factor 10: Words similarity with grammar (morphology sensitivity)
-  // =====================================================================
-
-  _scoreWordsWithGrammar(q, t, opt, breakdown) {
+  // 10 With-grammar: exact token jaccard (cheap)
+  _scoreWordsWithGrammarFast(q, t, opt, breakdown) {
     const w = opt.factorWeights.wordsSimilarityWithGrammar;
-
-    const sensitivityBase = opt.factorConfig.grammarWords.morphologySensitivity;
-    const sensitivity = this._clamp01(sensitivityBase * this._clampFocus(opt.focus.favorMorphology));
-
-    // exact overlap by surface forms (lowercased)
-    const qSet = new Set(q.tokens.map((x) => x.toLowerCase()));
-    const tSet = new Set(t.tokens.map((x) => x.toLowerCase()));
-    const exact = this._jaccardSet(qSet, tSet);
-
-    // soft form similarity: for each query token, best edit similarity to any target token
-    let soft = 0;
-    const maxLen = opt.factorConfig.grammarWords.maxEditDistanceLen;
-    const tLower = t.tokens.map((x) => x.toLowerCase());
-    for (let i = 0; i < q.tokens.length; i++) {
-      const a = q.tokens[i].toLowerCase();
-      let best = 0;
-      for (let j = 0; j < tLower.length; j++) {
-        const b = tLower[j];
-        const sim = (a.length <= maxLen && b.length <= maxLen) ? this._levenshteinSim01(a, b) : this._approxEditSimLong(a, b);
-        if (sim > best) best = sim;
-      }
-      soft += best;
-    }
-    soft /= Math.max(1, q.tokens.length);
-
-    // Morphology penalty: if stripped overlap high but exact low, penalize
-    const stripped = this._jaccardSet(q.tokenNGSet, t.tokenNGSet);
-    const morphDiff = Math.max(0, stripped - exact);
-    const penalty = sensitivity * 0.55 * morphDiff;
-
-    const score = this._clamp01((0.55 * exact + 0.45 * soft) - penalty);
-
-    breakdown.wordsSimilarityWithGrammar = {
-      score01: score,
-      weightUsed: w,
-      notes: `exact=${exact.toFixed(3)} soft=${soft.toFixed(3)} stripped=${stripped.toFixed(3)} penalty=${penalty.toFixed(3)} sens=${sensitivity.toFixed(2)}`
-    };
-    return score;
+    const qSet = new Set(q.tokens.map(x => x.toLowerCase()));
+    const tSet = new Set(t.tokens.map(x => x.toLowerCase()));
+    const jac = this._jaccardSet(qSet, tSet);
+    breakdown.wordsSimilarityWithGrammar = { score01: jac, weightUsed: w, notes: `exactTokenJaccard=${jac.toFixed(3)}` };
+    return jac;
   }
 
-  // =====================================================================
-  // SECTION Q — Factor 11: Emoji similarity
-  // =====================================================================
-
-  _scoreEmoji(q, t, opt, breakdown) {
-    const w = opt.factorWeights.emojiSimilarity;
-
-    const qe = q.emojiInfo;
-    const te = t.emojiInfo;
-
-    if (qe.list.length === 0 && te.list.length === 0) {
-      const s = 0.5;
-      breakdown.emojiSimilarity = { score01: s, weightUsed: w, notes: "No emoji; neutral" };
-      return s;
-    }
-    if (qe.list.length === 0 || te.list.length === 0) {
-      const s = 0.0;
-      breakdown.emojiSimilarity = { score01: s, weightUsed: w, notes: "Emoji on one side only" };
-      return s;
-    }
-
-    const setSim = this._jaccardSet(qe.set, te.set);
-    const posSim = this._binPatternSim(qe.posBins, te.posBins);
-    const score = this._clamp01(0.70 * setSim + opt.factorConfig.emoji.positionalWeight * posSim);
-
-    breakdown.emojiSimilarity = {
-      score01: score,
-      weightUsed: w,
-      notes: `setSim=${setSim.toFixed(3)} posSim=${posSim.toFixed(3)}`
-    };
-    return score;
-  }
-
-  // =====================================================================
-  // SECTION R — Factor 12 & 13: Section similarity
-  // =====================================================================
-
-  _scoreSection(q, t, opt, breakdown, which) {
+  // 12/13 Sections: cheap prefix + token overlap in section
+  _scoreSectionFast(q, t, opt, breakdown, which) {
     const name = (which === 1) ? "firstSectionSimilarity" : "secondSectionSimilarity";
     const w = opt.factorWeights[name];
 
     const qs = (which === 1) ? q.sections.first : q.sections.second;
     const ts = (which === 1) ? t.sections.first : t.sections.second;
 
-    const jw = this._jaroWinklerSim01(qs, ts, opt.factorConfig.sections.jaroPrefixScale);
-    const lev = this._levenshteinSim01(qs.toLowerCase(), ts.toLowerCase());
+    const pre = this._prefixSim01(qs.toLowerCase(), ts.toLowerCase(), which === 1 ? 24 : 18);
 
-    // token overlap within section
     const qTok = this._tokenizeEnglish(qs, opt.factorConfig.words);
     const tTok = this._tokenizeEnglish(ts, opt.factorConfig.words);
     const jac = this._jaccardSet(new Set(qTok), new Set(tTok));
 
-    // prefix focus is applied by weight multiplier earlier; still keep robust blend
-    const score = this._clamp01(0.46 * jw + 0.30 * lev + 0.24 * jac);
-
-    breakdown[name] = {
-      score01: score,
-      weightUsed: w,
-      notes: `jw=${jw.toFixed(3)} lev=${lev.toFixed(3)} jac=${jac.toFixed(3)}`
-    };
+    const score = this._clamp01(0.58 * pre + 0.42 * jac);
+    breakdown[name] = { score01: score, weightUsed: w, notes: `pre=${pre.toFixed(3)} jac=${jac.toFixed(3)}` };
     return score;
   }
 
-  // =====================================================================
-  // SECTION S — Factor 14: Follow grammar similarity
-  // =====================================================================
-
-  _scoreGrammarFollow(q, t, opt, breakdown) {
-    const w = opt.factorWeights.followGrammarSimilarity;
-
-    const qg = q.grammarFeat;
-    const tg = t.grammarFeat;
-
-    const cfg = opt.factorConfig.grammar;
-
-    const punctPatSim = this._jaccardSet(qg.punctPatternSet, tg.punctPatternSet);
-    const sentLenSim = this._histSim(qg.sentenceLenHist, tg.sentenceLenHist);
-    const funcSim = this._jaccardSet(qg.functionWordSet, tg.functionWordSet);
-    const svoSim = this._jaccardSet(qg.svoTriplesSet, tg.svoTriplesSet);
-    const clauseSim = this._jaccardSet(qg.clauseMarkersSet, tg.clauseMarkersSet);
-
-    const inner =
-      cfg.punctuationPatternWeight * punctPatSim +
-      cfg.posHeuristicWeight * (0.55 * svoSim + 0.45 * sentLenSim) +
-      cfg.functionWordWeight * (0.60 * funcSim + 0.40 * clauseSim);
-
-    const denom = (cfg.punctuationPatternWeight + cfg.posHeuristicWeight + cfg.functionWordWeight) || 1;
-    let score = inner / denom;
-
-    // Grammar focus multiplier
-    score = this._clamp01(score * this._clampFocus(opt.focus.favorGrammar));
-
-    breakdown.followGrammarSimilarity = {
-      score01: score,
-      weightUsed: w,
-      notes: `punctPat=${punctPatSim.toFixed(3)} sentLen=${sentLenSim.toFixed(3)} func=${funcSim.toFixed(3)} svo=${svoSim.toFixed(3)} clause=${clauseSim.toFixed(3)}`
-    };
-    return score;
+  _prefixSim01(a, b, cap) {
+    a = a || ""; b = b || "";
+    const n = Math.min(cap || 16, a.length, b.length);
+    if (n <= 0) return 0;
+    let same = 0;
+    for (let i = 0; i < n; i++) { if (a.charCodeAt(i) === b.charCodeAt(i)) same++; else break; }
+    return same / n;
   }
 
-  // =====================================================================
-  // SECTION T — Factor 15: Verb similarity
-  // =====================================================================
-
-  _scoreVerbs(q, t, opt, breakdown) {
-    const w = opt.factorWeights.verbSimilarity;
-
-    const qv = q.verbs;
-    const tv = t.verbs;
-
-    if (qv.set.size === 0 && tv.set.size === 0) {
-      const s = 0.5;
-      breakdown.verbSimilarity = { score01: s, weightUsed: w, notes: "No verbs detected; neutral" };
-      return s;
-    }
-    if (qv.set.size === 0 || tv.set.size === 0) {
-      const s = 0.0;
-      breakdown.verbSimilarity = { score01: s, weightUsed: w, notes: "Verbs on one side only" };
-      return s;
-    }
-
-    const setSim = this._jaccardSet(qv.set, tv.set);
-    const posSim = this._binPatternSim(qv.posBins, tv.posBins);
-
-    const score = this._clamp01(0.70 * setSim + opt.factorConfig.verbs.positionalWeight * posSim);
-
-    breakdown.verbSimilarity = {
-      score01: score,
-      weightUsed: w,
-      notes: `setSim=${setSim.toFixed(3)} posSim=${posSim.toFixed(3)}`
-    };
-    return score;
-  }
-
-  // =====================================================================
-  // SECTION U — Factor 16: Auxiliary verb similarity
-  // =====================================================================
-
-  _scoreAuxVerbs(q, t, opt, breakdown) {
-    const w = opt.factorWeights.auxiliaryVerbSimilarity;
-
-    const qa = q.aux;
-    const ta = t.aux;
-
-    if (qa.set.size === 0 && ta.set.size === 0) {
-      const s = 0.5;
-      breakdown.auxiliaryVerbSimilarity = { score01: s, weightUsed: w, notes: "No aux verbs; neutral" };
-      return s;
-    }
-    if (qa.set.size === 0 || ta.set.size === 0) {
-      const s = 0.0;
-      breakdown.auxiliaryVerbSimilarity = { score01: s, weightUsed: w, notes: "Aux verbs on one side only" };
-      return s;
-    }
-
-    const setSim = this._jaccardSet(qa.set, ta.set);
-    const posSim = this._binPatternSim(qa.posBins, ta.posBins);
-
-    const score = this._clamp01(0.75 * setSim + opt.factorConfig.aux.positionalWeight * posSim);
-
-    breakdown.auxiliaryVerbSimilarity = {
-      score01: score,
-      weightUsed: w,
-      notes: `setSim=${setSim.toFixed(3)} posSim=${posSim.toFixed(3)}`
-    };
-    return score;
-  }
-
-  // =====================================================================
-  // SECTION V — Fusion (weighted power mean + contradiction penalties)
-  // =====================================================================
+  /* ===================== FUSION + CONFIDENCE (same idea) ===================== */
 
   _fuseScores(scores, opt, factorNames) {
     const p = opt.fusion.powerMeanP;
@@ -14817,7 +14151,7 @@ class UltraTextMatcherTF {
       }
 
       if (c.semanticVsTokens && c.semanticVsTokens.enabled) {
-        const gw = opt.factorWeights.followGrammarSimilarity || 0;
+        const gw = opt.factorWeights.wordsSimilarity || 0;
         if (sem >= c.semanticVsTokens.semanticHigh && tok <= c.semanticVsTokens.tokenLow && gw > 0) {
           const weightShare = gw / (wSum || 1);
           const severity = (sem - c.semanticVsTokens.semanticHigh) / Math.max(1e-6, (1 - c.semanticVsTokens.semanticHigh));
@@ -14830,18 +14164,12 @@ class UltraTextMatcherTF {
     return { score01: pm, penalty };
   }
 
-  // =====================================================================
-  // SECTION W — Confidence (sigmoid + agreement shaping)
-  // =====================================================================
-
   _confidenceFromFactors(score01, scores, opt, factorNames) {
     const c = opt.fusion.confidence;
 
-    // Base sigmoid on final score
     const x = (score01 - c.center) * c.steepness;
     const base = 1 / (1 + Math.exp(-x));
 
-    // Weighted mean & weighted std for dispersion
     let wSum = 0;
     let mean = 0;
 
@@ -14864,22 +14192,19 @@ class UltraTextMatcherTF {
     }
     const std = (wSum > 0) ? Math.sqrt(varw / wSum) : 0;
 
-    const agreement = this._clamp01(1 - (std / 0.32));
+    const agreement = this._clamp01(1 - (std / 0.35));
     let conf = this._clamp01(base + c.agreementBoost * (agreement - 0.5) - c.dispersionPenalty * std);
 
-    // Cap confidence if semantic very low but score moderate (optional)
     if (c.capIfSemanticLow) {
       const sem = this._clamp01(scores.humanMeaningSimilarity ?? 0);
-      if (sem < 0.20 && score01 > 0.55) conf *= 0.85;
+      if (sem < 0.18 && score01 > 0.55) conf *= 0.85;
       if (sem < 0.10 && score01 > 0.45) conf *= 0.75;
     }
 
     return this._clamp01(conf);
   }
 
-  // =====================================================================
-  // SECTION X — BM25 corpus stats + scoring
-  // =====================================================================
+  /* ===================== BM25-LITE ===================== */
 
   _buildBM25(texts, wordsCfg) {
     const docCount = texts.length;
@@ -14887,18 +14212,27 @@ class UltraTextMatcherTF {
     const dl = new Array(docCount);
     let avgdl = 0;
 
+    // Precompute tokens per doc to avoid re-tokenizing in score
+    const docTokens = new Array(docCount);
+    const docTF = new Array(docCount);
+
     for (let i = 0; i < docCount; i++) {
       const toks = this._tokenizeEnglish(texts[i], wordsCfg);
+      docTokens[i] = toks;
       dl[i] = toks.length;
       avgdl += dl[i];
 
+      const tfm = new Map();
       const seen = new Set();
       for (let j = 0; j < toks.length; j++) {
         const tok = toks[j];
-        if (seen.has(tok)) continue;
-        seen.add(tok);
-        df.set(tok, (df.get(tok) || 0) + 1);
+        tfm.set(tok, (tfm.get(tok) || 0) + 1);
+        if (!seen.has(tok)) {
+          seen.add(tok);
+          df.set(tok, (df.get(tok) || 0) + 1);
+        }
       }
+      docTF[i] = tfm;
     }
 
     avgdl = (docCount > 0) ? (avgdl / docCount) : 0;
@@ -14909,7 +14243,7 @@ class UltraTextMatcherTF {
       idf.set(tok, v);
     }
 
-    return { docCount, df, idf, dl, avgdl, wordsCfg };
+    return { docCount, df, idf, dl, avgdl, wordsCfg, docTokens, docTF };
   }
 
   _bm25Score(queryTokens, docIndex, bm25, params, targetText, isOverrideTargets, opt) {
@@ -14920,22 +14254,8 @@ class UltraTextMatcherTF {
     const k1 = params.k1;
     const b = params.b;
 
-    // Build doc tf
-    let docTokens = null;
-
-    // If not override targets and feature cache enabled, try cache
-    if (!isOverrideTargets && opt.cache.featureCache) {
-      const feat = this._featureCache.get(this._tKey(docIndex));
-      if (feat && feat.tokens) docTokens = feat.tokens;
-    }
-
-    if (!docTokens) {
-      const txt = targetText ? (targetText[docIndex] || "") : (this._targetText[docIndex] || "");
-      docTokens = this._tokenizeEnglish(txt, bm25.wordsCfg || opt.factorConfig.words);
-    }
-
-    const tfm = new Map();
-    for (let i = 0; i < docTokens.length; i++) tfm.set(docTokens[i], (tfm.get(docTokens[i]) || 0) + 1);
+    const tfm = bm25.docTF?.[docIndex] || null;
+    if (!tfm) return 0;
 
     // Query tf
     const qtf = new Map();
@@ -14949,20 +14269,17 @@ class UltraTextMatcherTF {
 
       const denom = f + k1 * (1 - b + b * (dl / avgdl));
       const term = idf * (f * (k1 + 1)) / (denom || 1);
-      const qBoost = 1 + 0.10 * Math.min(3, qf - 1);
+      const qBoost = 1 + 0.08 * Math.min(3, qf - 1);
       score += term * qBoost;
     }
-
     return score;
   }
 
-  // =====================================================================
-  // SECTION Y — Tokenization, morphology, verbs, aux
-  // =====================================================================
+  /* ===================== TOKENIZATION / MORPHOLOGY ===================== */
 
   _tokenizeEnglish(text, cfg) {
     const minLen = cfg.minTokenLen || 2;
-    const maxTokens = cfg.maxTokens || 256;
+    const maxTokens = cfg.maxTokens || 64;
 
     const raw = String(text ?? "").toLowerCase();
     const parts = raw.split(/[^a-z0-9']+/g);
@@ -14976,49 +14293,35 @@ class UltraTextMatcherTF {
       tokens.push(t);
       if (tokens.length >= maxTokens) break;
     }
-
     return tokens;
   }
 
   _stripSuffixes(token, cfg) {
     token = token || "";
     const minRootLen = cfg.minRootLen || 3;
-
     if (token.length <= minRootLen) return token;
 
-    // tries -> try
     if (token.endsWith("ies") && token.length > minRootLen + 2) return token.slice(0, -3) + "y";
-
-    // running -> run (double consonant)
     if (token.endsWith("ing") && token.length > minRootLen + 2) {
       let root = token.slice(0, -3);
       if (root.length >= 2 && root[root.length - 1] === root[root.length - 2]) root = root.slice(0, -1);
       if (root.length >= minRootLen) return root;
     }
-
-    // studied -> study
     if (token.endsWith("ied") && token.length > minRootLen + 2) return token.slice(0, -3) + "y";
-
-    // walked -> walk
     if (token.endsWith("ed") && token.length > minRootLen + 1) {
       let root = token.slice(0, -2);
       if (root.endsWith("i") && root.length > minRootLen) root = root.slice(0, -1) + "y";
       if (root.length >= minRootLen) return root;
     }
-
-    // boxes -> box
     if (token.endsWith("es") && token.length > minRootLen + 1) {
       const root = token.slice(0, -2);
       if (root.length >= minRootLen) return root;
     }
-
-    // cats -> cat
     if (token.endsWith("s") && token.length > minRootLen) {
       const root = token.slice(0, -1);
       if (root.length >= minRootLen) return root;
     }
 
-    // fallback list
     const suff = cfg.stripSuffixes || [];
     for (let i = 0; i < suff.length; i++) {
       const s = suff[i];
@@ -15027,250 +14330,10 @@ class UltraTextMatcherTF {
         if (root.length >= minRootLen) return root;
       }
     }
-
     return token;
   }
 
-  _extractVerbs(tokens, cfg) {
-    const common = this._commonVerbSet();
-    const bins = cfg.bins || 24;
-
-    const set = new Set();
-    const posBins = new Uint8Array(bins);
-
-    const max = cfg.maxVerbs || 64;
-    const L = tokens.length || 0;
-
-    let count = 0;
-    for (let i = 0; i < L && count < max; i++) {
-      const tok = tokens[i];
-      if (this._isVerbLike(tok, common) && !this._isAuxVerb(tok)) {
-        set.add(tok);
-        const bi = Math.min(bins - 1, Math.floor((i / Math.max(1, L)) * bins));
-        posBins[bi] = 1;
-        count++;
-      }
-    }
-
-    return { set, posBins: Array.from(posBins) };
-  }
-
-  _extractAuxVerbs(tokens, cfg) {
-    const bins = cfg.bins || 24;
-
-    const set = new Set();
-    const posBins = new Uint8Array(bins);
-    const L = tokens.length || 0;
-
-    for (let i = 0; i < L; i++) {
-      const tok = tokens[i];
-      if (this._isAuxVerb(tok)) {
-        set.add(tok);
-        const bi = Math.min(bins - 1, Math.floor((i / Math.max(1, L)) * bins));
-        posBins[bi] = 1;
-      }
-    }
-
-    return { set, posBins: Array.from(posBins) };
-  }
-
-  _isAuxVerb(tok) {
-    return (
-      tok === "am" || tok === "is" || tok === "are" || tok === "was" || tok === "were" ||
-      tok === "be" || tok === "been" || tok === "being" ||
-      tok === "do" || tok === "does" || tok === "did" ||
-      tok === "have" || tok === "has" || tok === "had" ||
-      tok === "will" || tok === "would" || tok === "shall" || tok === "should" ||
-      tok === "can" || tok === "could" || tok === "may" || tok === "might" || tok === "must"
-    );
-  }
-
-  _commonVerbSet() {
-    return new Set([
-      "be","am","is","are","was","were","been","being",
-      "do","does","did","doing",
-      "have","has","had","having",
-      "go","goes","went","gone","going",
-      "get","gets","got","getting",
-      "make","makes","made","making",
-      "say","says","said","saying",
-      "see","sees","saw","seen","seeing",
-      "know","knows","knew","known","knowing",
-      "think","thinks","thought","thinking",
-      "take","takes","took","taken","taking",
-      "come","comes","came","coming",
-      "want","wants","wanted","wanting",
-      "use","uses","used","using",
-      "find","finds","found","finding",
-      "give","gives","gave","given","giving",
-      "tell","tells","told","telling",
-      "work","works","worked","working",
-      "call","calls","called","calling",
-      "try","tries","tried","trying",
-      "ask","asks","asked","asking",
-      "need","needs","needed","needing",
-      "feel","feels","felt","feeling",
-      "become","becomes","became","becoming",
-      "leave","leaves","left","leaving",
-      "put","puts","putting",
-      "submit","submits","submitted","submitting",
-      "deliver","delivers","delivered","delivering",
-      "send","sends","sent","sending",
-      "receive","receives","received","receiving",
-      "pay","pays","paid","paying"
-    ]);
-  }
-
-  _isVerbLike(tok, common) {
-    if (!tok) return false;
-    if (common.has(tok)) return true;
-    if (tok.endsWith("ed") && tok.length > 3) return true;
-    if (tok.endsWith("ing") && tok.length > 4) return true;
-    // cautious -s
-    if (tok.endsWith("s") && tok.length > 3 && /[aeiou]/.test(tok)) return true;
-    return false;
-  }
-
-  // =====================================================================
-  // SECTION Z — Grammar heuristics extraction
-  // =====================================================================
-
-  _extractGrammarHeuristics(raw, tokens, cfg) {
-    raw = raw || "";
-    tokens = tokens || [];
-
-    // Sentence split on punctuation boundaries
-    const sentences = raw.split(/(?<=[.!?])\s+/g).slice(0, cfg.maxSentences || 12);
-
-    // Sentence length histogram
-    const sentenceLenHist = new Array(8).fill(0);
-    for (let i = 0; i < sentences.length; i++) {
-      const toks = this._tokenizeEnglish(sentences[i], this._options.factorConfig.words);
-      const wc = toks.length;
-      const bi = Math.min(7, Math.floor(wc / 6));
-      sentenceLenHist[bi] += 1;
-    }
-
-    // Punctuation pattern set
-    const punctPatternSet = new Set();
-    const pseq = raw.match(/[.,;:!?]{1,3}/g) || [];
-    for (let i = 0; i < pseq.length; i++) punctPatternSet.add(pseq[i]);
-
-    // Function words
-    const funcWords = this._functionWordSet();
-    const functionWordSet = new Set();
-    for (let i = 0; i < tokens.length; i++) {
-      const t = tokens[i];
-      if (funcWords.has(t)) functionWordSet.add(t);
-    }
-
-    // Clause markers set
-    const clauseMarkersSet = new Set();
-    const markerTokens = ["and","but","or","so","because","although","though","while","if","when","then","however","therefore","moreover","since","unless","whereas","that","which","who","whom"];
-    const markerSet = new Set(markerTokens);
-    for (let i = 0; i < tokens.length; i++) if (markerSet.has(tokens[i])) clauseMarkersSet.add(tokens[i]);
-    if (raw.includes(",")) clauseMarkersSet.add(",");
-
-    // SVO heuristic triples
-    const svoTriplesSet = this._extractSVOTriples(tokens, cfg.svoWindow || 7);
-
-    return {
-      sentenceLenHist,
-      punctPatternSet,
-      functionWordSet,
-      clauseMarkersSet,
-      svoTriplesSet
-    };
-  }
-
-  _functionWordSet() {
-    return new Set([
-      "a","an","the","this","that","these","those",
-      "in","on","at","to","from","of","for","with","without","into","onto","over","under","above","below","between","among","through","during","before","after","about","around","near","by",
-      "and","but","or","nor","so","yet",
-      "if","then","else","when","while","because","since","although","though","unless","until","whereas",
-      "i","you","he","she","it","we","they","me","him","her","us","them","my","your","his","her","our","their","mine","yours","hers","ours","theirs",
-      "what","which","who","whom","whose","where","why","how",
-      "not","no","yes","very","just","only","also","even","still","already",
-      "be","am","is","are","was","were","been","being",
-      "do","does","did","doing",
-      "have","has","had","having",
-      "will","would","shall","should","can","could","may","might","must"
-    ]);
-  }
-
-  _extractSVOTriples(tokens, window) {
-    const pron = new Set(["i","you","he","she","it","we","they","this","that","these","those","someone","something","anyone","anything"]);
-    const commonVerbs = this._commonVerbSet();
-
-    const triples = new Set();
-    const maxTriples = 24;
-
-    for (let i = 0, count = 0; i < tokens.length && count < maxTriples; i++) {
-      const v = tokens[i];
-      if (!this._isVerbLike(v, commonVerbs)) continue;
-
-      // subject before
-      const s0 = Math.max(0, i - window);
-      let subj = "";
-      for (let j = i - 1; j >= s0; j--) {
-        const t = tokens[j];
-        if (pron.has(t) || this._isNounLike(t)) { subj = this._coarseWordClass(t, pron); break; }
-      }
-
-      // object after
-      const o1 = Math.min(tokens.length, i + 1 + window);
-      let obj = "";
-      for (let j = i + 1; j < o1; j++) {
-        const t = tokens[j];
-        if (this._isNounLike(t)) { obj = this._coarseWordClass(t, pron); break; }
-      }
-
-      const verbClass = this._coarseVerbClass(v);
-
-      if (subj || obj) {
-        triples.add(`${subj || "X"}:${verbClass}:${obj || "Y"}`);
-        count++;
-      }
-    }
-
-    return triples;
-  }
-
-  _isNounLike(tok) {
-    if (!tok) return false;
-    if (tok.length <= 2) return false;
-    if (/^\d+$/.test(tok)) return false;
-
-    const fw = this._functionWordSet();
-    if (fw.has(tok)) return false;
-
-    if (/(tion|ment|ness|ship|ism|ist|ity|ance|ence|hood|age|ery|ary|ory|ure)$/.test(tok)) return true;
-    if (/^[a-z][a-z0-9']+$/.test(tok) && tok.length >= 4) return true;
-    return false;
-  }
-
-  _coarseWordClass(tok, pronSet) {
-    if (pronSet.has(tok)) return "PRON";
-    if (/^\d+$/.test(tok)) return "NUM";
-    if (this._isNounLike(tok)) return "NOUN";
-    return "X";
-  }
-
-  _coarseVerbClass(tok) {
-    if (!tok) return "V";
-    if (tok.endsWith("ing")) return "V_ING";
-    if (tok.endsWith("ed")) return "V_ED";
-    if (tok === "is" || tok === "are" || tok === "was" || tok === "were" || tok === "be" || tok === "been" || tok === "being") return "AUX_BE";
-    if (tok === "do" || tok === "does" || tok === "did") return "AUX_DO";
-    if (tok === "have" || tok === "has" || tok === "had") return "AUX_HAVE";
-    if (tok === "will" || tok === "would" || tok === "shall" || tok === "should" || tok === "can" || tok === "could" || tok === "may" || tok === "might" || tok === "must") return "MODAL";
-    return "V";
-  }
-
-  // =====================================================================
-  // SECTION AA — Numbers, case, spaces, punctuation, emoji, sections
-  // =====================================================================
+  /* ===================== NUMBERS / NGRAMS / SIMS ===================== */
 
   _extractNumbers(text, maxN) {
     const re = /[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/g;
@@ -15305,139 +14368,14 @@ class UltraTextMatcherTF {
     return 1 / (1 + rel);
   }
 
-  _extractCasePattern(raw, bins) {
-    const L = raw.length || 0;
-    let upper = 0, lower = 0;
-    const upperBins = new Uint8Array(bins);
-    const lowerBins = new Uint8Array(bins);
-
-    for (let i = 0; i < L; i++) {
-      const c = raw.charCodeAt(i);
-      if (c >= 65 && c <= 90) {
-        upper++;
-        const bi = Math.min(bins - 1, Math.floor((i / Math.max(1, L)) * bins));
-        upperBins[bi] = 1;
-      } else if (c >= 97 && c <= 122) {
-        lower++;
-        const bi = Math.min(bins - 1, Math.floor((i / Math.max(1, L)) * bins));
-        lowerBins[bi] = 1;
-      }
-    }
-
-    return {
-      upper,
-      lower,
-      upperRatio: (L > 0) ? upper / L : 0,
-      lowerRatio: (L > 0) ? lower / L : 0,
-      upperBins: Array.from(upperBins),
-      lowerBins: Array.from(lowerBins)
-    };
-  }
-
-  _extractSpacesPattern(raw, cfg) {
-    const runMax = cfg.runMax || 80;
-    const bins = cfg.bins || 24;
-
-    const L = raw.length || 0;
-    let spaceCount = 0;
-    const runs = [];
-    let cur = 0;
-    const posBins = new Uint8Array(bins);
-
-    for (let i = 0; i < L; i++) {
-      const ch = raw[i];
-      const isSpace = (ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f" || ch === "\v");
-      if (isSpace) {
-        spaceCount++;
-        cur++;
-        const bi = Math.min(bins - 1, Math.floor((i / Math.max(1, L)) * bins));
-        posBins[bi] = 1;
-      } else {
-        if (cur > 0) {
-          runs.push(Math.min(runMax, cur));
-          cur = 0;
-        }
-      }
-    }
-    if (cur > 0) runs.push(Math.min(runMax, cur));
-
-    return { spaceCount, runs: runs.slice(0, 80), posBins: Array.from(posBins) };
-  }
-
-  _extractPunctuation(raw, cfg) {
-    const bins = cfg.bins || 24;
-
-    const punctChars = raw.match(/[.,;:!?'"(){}\[\]\-_/\\@#$%^&*+=<>`~|]/g) || [];
-    const set = new Set(punctChars);
-    const L = raw.length || 0;
-    const density = (L > 0) ? punctChars.length / L : 0;
-
-    const posBins = new Uint8Array(bins);
-    if (cfg.trackPositions) {
-      const maxPositions = cfg.maxPositions || 256;
-      for (let i = 0, c = 0; i < L && c < maxPositions; i++) {
-        const ch = raw[i];
-        if (/[.,;:!?'"(){}\[\]\-_/\\@#$%^&*+=<>`~|]/.test(ch)) {
-          const bi = Math.min(bins - 1, Math.floor((i / Math.max(1, L)) * bins));
-          posBins[bi] = 1;
-          c++;
-        }
-      }
-    }
-
-    return { list: punctChars, set, density, posBins: Array.from(posBins) };
-  }
-
-  _extractEmoji(raw, cfg) {
-    const maxEmoji = cfg.maxEmoji || 64;
-    const bins = cfg.bins || 24;
-
-    let list = [];
-    try {
-      const re = /\p{Extended_Pictographic}/gu;
-      const m = raw.match(re);
-      if (m) list = m.slice(0, maxEmoji);
-    } catch (_e) {
-      const re2 = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{26FF}]/gu;
-      const m2 = raw.match(re2);
-      if (m2) list = m2.slice(0, maxEmoji);
-    }
-
-    const set = new Set(list);
-
-    const posBins = new Uint8Array(bins);
-    const L = raw.length || 0;
-
-    if (L > 0 && list.length > 0) {
-      // best-effort scan
-      let count = 0;
-      for (let i = 0; i < raw.length && count < maxEmoji; i++) {
-        const ch = raw[i];
-        if (set.has(ch)) {
-          const bi = Math.min(bins - 1, Math.floor((i / L) * bins));
-          posBins[bi] = 1;
-          count++;
-        }
-      }
-    }
-
-    return { list, set, posBins: Array.from(posBins) };
-  }
-
   _extractSections(raw, cfg) {
     const s = raw || "";
-    const first = s.slice(0, cfg.firstChars || 140);
-
+    const first = s.slice(0, cfg.firstChars || 120);
     const L = s.length || 0;
     const start = Math.floor(L / 3);
-    const second = s.slice(start, Math.min(L, start + (cfg.secondChars || 170)));
-
+    const second = s.slice(start, Math.min(L, start + (cfg.secondChars || 140)));
     return { first, second };
   }
-
-  // =====================================================================
-  // SECTION AB — Char & token n-grams
-  // =====================================================================
 
   _charNGrams(str, n, maxCount) {
     const out = [];
@@ -15449,18 +14387,6 @@ class UltraTextMatcherTF {
     return out;
   }
 
-  _tokenNGrams(tokens, n, maxCount) {
-    const out = [];
-    if (!tokens || tokens.length < n) return out;
-    const cap = Math.min(maxCount || 1e9, tokens.length - n + 1);
-    for (let i = 0; i < cap; i++) out.push(tokens.slice(i, i + n).join(" "));
-    return out;
-  }
-
-  // =====================================================================
-  // SECTION AC — Similarities: Jaccard, bin pattern, hist, edit, Jaro-Winkler
-  // =====================================================================
-
   _jaccardSet(a, b) {
     if (!a || !b) return 0;
     const as = a.size || 0;
@@ -15469,198 +14395,27 @@ class UltraTextMatcherTF {
     if (as === 0 || bs === 0) return 0;
 
     let inter = 0;
-    if (as < bs) {
-      for (const x of a) if (b.has(x)) inter++;
-    } else {
-      for (const x of b) if (a.has(x)) inter++;
-    }
+    if (as < bs) for (const x of a) if (b.has(x)) inter++;
+    else for (const x of b) if (a.has(x)) inter++;
+
     const uni = as + bs - inter;
     return uni > 0 ? inter / uni : 0;
   }
 
-  _jaccardArr(a, b) {
-    return this._jaccardSet(new Set(a || []), new Set(b || []));
-  }
-
-  _binPatternSim(a, b) {
-    if (!a || !b) return 0;
-    const n = Math.max(a.length, b.length);
-    if (n === 0) return 1;
-
-    let dot = 0, na = 0, nb = 0;
-    for (let i = 0; i < n; i++) {
-      const x = a[i] || 0;
-      const y = b[i] || 0;
-      dot += x * y;
-      na += x * x;
-      nb += y * y;
-    }
-    if (na === 0 && nb === 0) return 1;
-    if (na === 0 || nb === 0) return 0;
-    return this._clamp01(dot / (Math.sqrt(na) * Math.sqrt(nb)));
-  }
-
-  _histSim(a, b) {
-    a = a || [];
-    b = b || [];
-    const n = Math.max(a.length, b.length);
-    let sum = 0, diff = 0;
-    for (let i = 0; i < n; i++) {
-      const x = a[i] || 0;
-      const y = b[i] || 0;
-      sum += x + y;
-      diff += Math.abs(x - y);
-    }
-    if (sum === 0) return 1;
-    return this._clamp01(1 - diff / sum);
-  }
-
-  _levenshteinDistance(a, b) {
-    a = a || ""; b = b || "";
-    const n = a.length, m = b.length;
-    if (n === 0) return m;
-    if (m === 0) return n;
-
-    // Ensure m <= n for less memory
-    if (m > n) return this._levenshteinDistance(b, a);
-
-    const prev = new Uint32Array(m + 1);
-    const curr = new Uint32Array(m + 1);
-    for (let j = 0; j <= m; j++) prev[j] = j;
-
-    for (let i = 1; i <= n; i++) {
-      curr[0] = i;
-      const ca = a.charCodeAt(i - 1);
-      for (let j = 1; j <= m; j++) {
-        const cb = b.charCodeAt(j - 1);
-        const cost = (ca === cb) ? 0 : 1;
-        const del = prev[j] + 1;
-        const ins = curr[j - 1] + 1;
-        const sub = prev[j - 1] + cost;
-        let v = del < ins ? del : ins;
-        if (sub < v) v = sub;
-        curr[j] = v;
-      }
-      for (let j = 0; j <= m; j++) prev[j] = curr[j];
-    }
-    return prev[m];
-  }
-
-  _levenshteinSim01(a, b) {
-    const d = this._levenshteinDistance(a, b);
-    const m = Math.max(1, a.length, b.length);
-    return 1 - Math.min(1, d / m);
-  }
-
-  _commonPrefixLen(a, b, cap) {
-    const n = Math.min(cap, a.length, b.length);
-    let i = 0;
-    for (; i < n; i++) if (a.charCodeAt(i) !== b.charCodeAt(i)) break;
-    return i;
-  }
-
-  _commonSuffixLen(a, b, cap) {
-    const n = Math.min(cap, a.length, b.length);
-    let i = 0;
-    for (; i < n; i++) {
-      if (a.charCodeAt(a.length - 1 - i) !== b.charCodeAt(b.length - 1 - i)) break;
-    }
-    return i;
-  }
-
-  _approxEditSimLong(a, b) {
-    const al = a.length, bl = b.length;
-    if (al === 0 && bl === 0) return 1;
-    if (al === 0 || bl === 0) return 0;
-
-    const pre = this._commonPrefixLen(a, b, 64) / Math.min(64, Math.min(al, bl));
-    const suf = this._commonSuffixLen(a, b, 64) / Math.min(64, Math.min(al, bl));
-    const lenSim = 1 - Math.min(1, Math.abs(al - bl) / Math.max(al, bl));
-
-    const sa = a.slice(0, 128) + a.slice(Math.max(0, al - 128));
-    const sb = b.slice(0, 128) + b.slice(Math.max(0, bl - 128));
-    const A = new Set(this._charNGrams(sa, 3, 1200));
-    const B = new Set(this._charNGrams(sb, 3, 1200));
-    const jac = this._jaccardSet(A, B);
-
-    return this._clamp01(0.33 * pre + 0.27 * suf + 0.18 * lenSim + 0.22 * jac);
-  }
-
-  _jaroSim01(s1, s2) {
-    const len1 = s1.length, len2 = s2.length;
-    if (len1 === 0 && len2 === 0) return 1;
-    if (len1 === 0 || len2 === 0) return 0;
-
-    const matchDist = Math.floor(Math.max(len1, len2) / 2) - 1;
-    const s1Matches = new Array(len1).fill(false);
-    const s2Matches = new Array(len2).fill(false);
-
-    let matches = 0;
-    for (let i = 0; i < len1; i++) {
-      const start = Math.max(0, i - matchDist);
-      const end = Math.min(i + matchDist + 1, len2);
-      for (let j = start; j < end; j++) {
-        if (s2Matches[j]) continue;
-        if (s1.charCodeAt(i) !== s2.charCodeAt(j)) continue;
-        s1Matches[i] = true;
-        s2Matches[j] = true;
-        matches++;
-        break;
-      }
-    }
-    if (matches === 0) return 0;
-
-    let k = 0;
-    let trans = 0;
-    for (let i = 0; i < len1; i++) {
-      if (!s1Matches[i]) continue;
-      while (!s2Matches[k]) k++;
-      if (s1.charCodeAt(i) !== s2.charCodeAt(k)) trans++;
-      k++;
-    }
-    trans /= 2;
-
-    return (matches / len1 + matches / len2 + (matches - trans) / matches) / 3;
-  }
-
-  _jaroWinklerSim01(s1, s2, prefixScale) {
-    const j = this._jaroSim01(s1, s2);
-    const l = Math.min(4, this._commonPrefixLen(s1, s2, 4));
-    const p = (typeof prefixScale === "number") ? prefixScale : 0.1;
-    return this._clamp01(j + l * p * (1 - j));
-  }
-
-  // =====================================================================
-  // SECTION AD — Focus application (amplifies manual weights)
-  // =====================================================================
+  /* ===================== FUSION FOCUS / NORMALIZE ===================== */
 
   _applyFocus(opt) {
-    // Make a shallow clone to avoid mutating shared options object in caller
     const o = this._deepMerge(opt, {});
     const fw = o.factorWeights;
 
     const meaning = this._clampFocus(o.focus.favorMeaning);
     const numbers = this._clampFocus(o.focus.favorNumbers);
     const prefix = this._clampFocus(o.focus.favorPrefix);
-    const emoji = this._clampFocus(o.focus.favorEmoji);
-    const grammar = this._clampFocus(o.focus.favorGrammar);
 
-    // Apply multipliers
     fw.humanMeaningSimilarity *= meaning;
     fw.numericSimilarity *= numbers;
     fw.firstSectionSimilarity *= prefix;
-    fw.emojiSimilarity *= emoji;
-    fw.followGrammarSimilarity *= grammar;
 
-    // Keep exactness from dominating semantic by default (soft cap)
-    // If user *really* wants exactness, they can still force high values, but cap prevents accidental dominance.
-    const sem = fw.humanMeaningSimilarity || 1;
-    const cap = 3.8 * sem;
-    fw.alphabeticSimilarity = Math.min(fw.alphabeticSimilarity, cap * 0.55);
-    fw.spacesSimilarity = Math.min(fw.spacesSimilarity, cap * 0.25);
-    fw.punctuationSimilarity = Math.min(fw.punctuationSimilarity, cap * 0.35);
-
-    // Re-normalize any invalids
     this._normalizeFactorWeights(o);
     return o;
   }
@@ -15681,9 +14436,54 @@ class UltraTextMatcherTF {
     return Math.max(0.15, Math.min(6.0, x));
   }
 
-  // =====================================================================
-  // SECTION AE — Utilities: time, rounding, deep merge, micro yield, debug
-  // =====================================================================
+  /* ===================== EMBED LRU ===================== */
+
+  _eKey(text, opt) {
+    if (opt.cache.embeddingCacheKey === "hash") return "E:" + this._hash32(text);
+    return "E:" + text;
+  }
+
+  _embedLRUGet(key) {
+    const e = this._embedLRU.get(key);
+    if (!e) return null;
+    e.lastUsed = this._now();
+    return e.vec;
+  }
+
+  _embedLRUSet(key, vec, opt) {
+    const limitBytes = Math.max(1, (opt.cache.embeddingCacheLimitMB || 64) * 1024 * 1024);
+    const bytes = vec.byteLength || (vec.length * 4);
+
+    const ex = this._embedLRU.get(key);
+    if (ex) {
+      this._embedLRUBytes -= ex.bytes || 0;
+      this._embedLRU.delete(key);
+    }
+
+    this._embedLRU.set(key, { vec, dim: vec.length, bytes, lastUsed: this._now() });
+    this._embedLRUBytes += bytes;
+
+    if (this._embedLRUBytes > limitBytes) this._embedLRUEvict(limitBytes, opt);
+  }
+
+  _embedLRUEvict(limitBytes, opt) {
+    const arr = Array.from(this._embedLRU.entries());
+    arr.sort((a, b) => (a[1].lastUsed - b[1].lastUsed));
+    for (let i = 0; i < arr.length && this._embedLRUBytes > limitBytes; i++) {
+      const key = arr[i][0];
+      const ent = arr[i][1];
+      this._embedLRU.delete(key);
+      this._embedLRUBytes -= ent.bytes || 0;
+    }
+    if (opt.debug.enabled && opt.debug.logCache) this._dInfo(opt, `embedLRU evicted, bytes=${this._embedLRUBytes}`);
+  }
+
+  _embedLRUClear() {
+    this._embedLRU.clear();
+    this._embedLRUBytes = 0;
+  }
+
+  /* ===================== UTILITIES ===================== */
 
   _now() {
     return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
@@ -15722,15 +14522,10 @@ class UltraTextMatcherTF {
 
     for (const k of Object.keys(b)) {
       const bv = b[k];
-
-      // ✅ KEY FIX: do not overwrite defaults with undefined
       if (bv === undefined) continue;
 
       const av = out[k];
-      if (
-        bv && typeof bv === "object" && !Array.isArray(bv) &&
-        av && typeof av === "object" && !Array.isArray(av)
-      ) {
+      if (bv && typeof bv === "object" && !Array.isArray(bv) && av && typeof av === "object" && !Array.isArray(av)) {
         out[k] = this._deepMerge(av, bv);
       } else {
         out[k] = bv;
@@ -15739,47 +14534,16 @@ class UltraTextMatcherTF {
     return out;
   }
 
-  _safeNumTensors() {
-    try {
-      return (typeof tf !== "undefined" && tf.memory) ? (tf.memory().numTensors || 0) : -1;
-    } catch (_e) {
-      return -1;
-    }
-  }
-
   _dInfo(opt, ...args) {
     if (opt.debug && opt.debug.enabled) console.log("[UltraTextMatcherTF]", ...args);
   }
-
   _dWarn(opt, ...args) {
     if ((opt.debug && opt.debug.enabled) || (opt.debug && opt.debug.logWarnings)) console.warn("[UltraTextMatcherTF]", ...args);
-  }
-
-  async _pickBestBackend(preferred) {
-    const prefs = Array.isArray(preferred) ? preferred : ["webgl", "cpu"];
-    for (let i = 0; i < prefs.length; i++) {
-      const b = prefs[i];
-      try {
-        await tf.setBackend(b);
-        await tf.ready();
-        return b;
-      } catch (_e) {}
-    }
-    return tf.getBackend();
   }
 
   async _microYield(opt) {
     const s = opt.perf.microYield || {};
     if (!s.enabled) return;
-
-    if (s.strategy === "idle" && typeof requestIdleCallback !== "undefined") {
-      await new Promise((resolve) => requestIdleCallback(() => resolve(), { timeout: 16 }));
-      return;
-    }
-    if (s.strategy === "raf" && typeof requestAnimationFrame !== "undefined") {
-      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-      return;
-    }
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
@@ -15800,89 +14564,19 @@ class UltraTextMatcherTF {
     return h.toString(16);
   }
 
-  // =====================================================================
-  // SECTION AF — Minimal HTML usage snippet (at bottom)
-  // =====================================================================
-}
-
-
-/* ============================================================
-   Product + Conversation Search (Wrappers on UltraTextMatcherTF)
-   - Assumes UltraTextMatcherTF class is already loaded (your big class)
-   - Goal:
-     1) Product match from sheet2 (prodData) with FIELD priorities
-     2) Then message match from sheet1 (convData) with full debug output
-   - Robust: missing fields ok, no crash
-   - Fast: one matcher instance per dataset; heavy caches reused
-   ============================================================ */
-
-/* ---------------------------
-   Small helpers (safe)
---------------------------- */
-function safeStr(x) {
-  if (x === null || x === undefined) return "";
-  if (typeof x === "string") return x;
-  if (typeof x === "number" || typeof x === "boolean") return String(x);
-  try { return JSON.stringify(x); } catch { return String(x); }
-}
-
-function joinClean(arr, sep = " | ") {
-  return arr.map(safeStr).map(s => s.trim()).filter(Boolean).join(sep);
-}
-
-function pick(obj, path, fallback = undefined) {
-  try {
-    const parts = path.split(".");
-    let cur = obj;
-    for (const p of parts) {
-      if (!cur || typeof cur !== "object") return fallback;
-      cur = cur[p];
+  _fnv1a32(s) {
+    s = String(s);
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = (h * 0x01000193) >>> 0;
     }
-    return cur === undefined ? fallback : cur;
-  } catch {
-    return fallback;
+    return h >>> 0;
   }
-}
-
-function flattenObject(obj, maxPairs = 40) {
-  // "Brand: Apple; Model: iPhone 14 Pro Max; Storage: 256GB"
-  if (!obj || typeof obj !== "object") return "";
-  const out = [];
-  const keys = Object.keys(obj);
-  for (let i = 0; i < keys.length && out.length < maxPairs; i++) {
-    const k = keys[i];
-    const v = obj[k];
-    if (v === null || v === undefined) continue;
-    if (typeof v === "object") continue; // keep it shallow; avoid huge nested
-    out.push(`${k}: ${safeStr(v)}`);
-  }
-  return out.join("; ");
-}
-
-function defaultFieldWeights() {
-  return {
-    name: 1.00,
-    brand: 0.55,
-    model: 0.60,
-    tags: 0.45,
-    category: 0.35,
-    description: 0.30,
-    specifications: 0.25,
-    seller: 0.15
-  };
-}
-
-function clamp01(x) {
-  if (x <= 0) return 0;
-  if (x >= 1) return 1;
-  return x;
 }
 
 /* ============================================================
-   1) ProductFieldMatcher
-   - Builds ONE target list = many "field targets"
-   - Each target corresponds to one product field string.
-   - Runs UltraTextMatcherTF once, then aggregates results per product.
+   1) ProductFieldMatcher (UNCHANGED API)
    ============================================================ */
 class ProductFieldMatcher {
   constructor(products = [], options = {}) {
@@ -15890,9 +14584,8 @@ class ProductFieldMatcher {
     this._opt = this._deepMerge(this._defaultOptions(), options || {});
     this._matcher = null;
 
-    // Built targets
-    this._fieldTargets = [];     // [{id,text,meta}]
-    this._productIndexById = new Map(); // productId -> index
+    this._fieldTargets = [];
+    this._productIndexById = new Map();
 
     this._buildTargets();
     this._buildMatcher();
@@ -15900,53 +14593,36 @@ class ProductFieldMatcher {
 
   _defaultOptions() {
     return {
-      // Default field weights (you can override per-call too)
       fieldWeights: defaultFieldWeights(),
 
-      // Performance
       perf: {
-        // topK for FIELD matches (not final products)
-        // If you have many products, use 60-200 based on size
         topKFields: 120,
-        semanticBatchSize: 64,
+        semanticBatchSize: 128,
         maxTargetsSafety: 250000
       },
 
-      // Product normalization controls
       extract: {
-        // which fields to include
         include: ["name", "brand", "model", "tags", "category", "description", "specifications", "seller"],
-        // if a text is too long, slice it (avoid huge embeds)
         maxFieldChars: {
-          name: 140,
+          name: 120,
           brand: 60,
           model: 80,
-          tags: 180,
+          tags: 160,
           category: 80,
-          description: 420,
-          specifications: 520,
+          description: 280,
+          specifications: 320,
           seller: 80
         }
       },
 
-      // Underlying UltraTextMatcherTF options
       matcherOptions: {
-        debug: {
-          enabled: false,
-          logTimings: true,
-          logWarnings: true,
-          logBatches: false,
-          logCache: false,
-          logTopK: false,
-          logFactorBreakdown: false,
-          groupCollapsed: true
-        },
+        debug: { enabled: false, logTimings: true, logWarnings: true },
         perf: {
-          topK: 5, // overridden per-call
-          semanticBatchSize: 64,
-          microYield: { enabled: true, everyItems: 96, strategy: "timeout0" },
+          topK: 5,
+          semanticBatchSize: 128,
+          microYield: { enabled: true, everyItems: 256, strategy: "timeout0" },
           timeBudgetMs: 0,
-          nonSemanticFastPath: false,
+          nonSemanticFastPath: true,
           maxTargetsSafety: 250000
         },
         cache: {
@@ -15954,7 +14630,7 @@ class ProductFieldMatcher {
           queryFeatureCache: true,
           embeddingCache: true,
           embeddingCacheKey: "hash",
-          embeddingCacheLimitMB: 192,
+          embeddingCacheLimitMB: 64,
           autoClearAfterMatch: false
         },
         meta: {
@@ -15963,7 +14639,7 @@ class ProductFieldMatcher {
           boost: {
             importanceField: "auto",
             importanceMode: "sigmoid",
-            importanceScale: 0.0,   // keep 0 by default for products (we use fieldWeight)
+            importanceScale: 0.0,
             clampAdd: 0.15,
             clampMultMin: 0.85,
             clampMultMax: 1.15
@@ -15971,15 +14647,12 @@ class ProductFieldMatcher {
           includeMetaInDiagnostics: false
         },
         focus: {
-          favorMeaning: 1.25,
+          favorMeaning: 1.15,
           favorNumbers: 1.25,
-          favorPrefix: 1.15,
-          favorEmoji: 1.0,
-          favorGrammar: 1.1,
-          favorMorphology: 1.05,
-          favorTokens: 1.2,
-          favorPunctuation: 1.0,
-          favorCase: 1.0
+          favorPrefix: 1.1,
+          favorGrammar: 1.0,
+          favorMorphology: 1.0,
+          favorTokens: 1.2
         }
       }
     };
@@ -15990,30 +14663,25 @@ class ProductFieldMatcher {
     if (typeof b !== "object") return b;
     if (a === null || a === undefined) return b;
     if (typeof a !== "object") return a;
-
     const out = Array.isArray(a) ? a.slice() : { ...a };
     for (const k of Object.keys(b)) {
       const bv = b[k];
       const av = out[k];
-      if (bv && typeof bv === "object" && !Array.isArray(bv) && av && typeof av === "object" && !Array.isArray(av)) {
-        out[k] = this._deepMerge(av, bv);
-      } else {
-        out[k] = bv;
-      }
+      if (bv && typeof bv === "object" && !Array.isArray(bv) && av && typeof av === "object" && !Array.isArray(av)) out[k] = this._deepMerge(av, bv);
+      else out[k] = bv;
     }
     return out;
   }
 
   _sliceField(text, fieldKey) {
     const m = this._opt.extract.maxFieldChars || {};
-    const cap = (typeof m[fieldKey] === "number") ? m[fieldKey] : 500;
+    const cap = (typeof m[fieldKey] === "number") ? m[fieldKey] : 300;
     const s = safeStr(text).trim();
     if (!s) return "";
     return (s.length > cap) ? (s.slice(0, cap) + "…") : s;
   }
 
   _extractBrand(prod) {
-    // brand might be prod.brand or prod.specifications.Brand
     const b1 = pick(prod, "brand", "");
     if (b1) return b1;
     const b2 = pick(prod, "specifications.Brand", "");
@@ -16058,7 +14726,6 @@ class ProductFieldMatcher {
       const specs = include.has("specifications") ? this._sliceField(flattenObject(p.specifications), "specifications") : "";
       const seller = include.has("seller") ? this._sliceField(this._extractSeller(p), "seller") : "";
 
-      // Create one target per field so we can attribute score to field
       const fields = [
         ["name", name],
         ["brand", brand],
@@ -16075,8 +14742,6 @@ class ProductFieldMatcher {
         if (!text) continue;
 
         const weight = (typeof fw[fieldKey] === "number") ? fw[fieldKey] : 0.2;
-
-        // id must be unique; tie back to product+field
         const fid = `${pid}::${fieldKey}`;
 
         this._fieldTargets.push({
@@ -16095,7 +14760,6 @@ class ProductFieldMatcher {
   }
 
   _buildMatcher() {
-    // One UltraTextMatcherTF instance for all product-field targets
     this._matcher = new UltraTextMatcherTF(this._fieldTargets, {
       ...this._opt.matcherOptions,
       perf: {
@@ -16113,26 +14777,10 @@ class ProductFieldMatcher {
   setProducts(products) {
     this._products = Array.isArray(products) ? products : [];
     this._buildTargets();
-    if (this._matcher) {
-      // reuse same model instance, just update targets
-      this._matcher.setTargets(this._fieldTargets);
-    } else {
-      this._buildMatcher();
-    }
+    if (this._matcher) this._matcher.setTargets(this._fieldTargets);
+    else this._buildMatcher();
   }
 
-  /**
-   * Match products by query, with field priorities.
-   * @param {string} query
-   * @param {object} opts
-   *  - topKProducts: final products count
-   *  - topKFields: how many field-hits to retrieve from matcher (bigger => better recall)
-   *  - fieldWeights: override weights {name,brand,tags,...}
-   *  - focus: UltraTextMatcherTF focus overrides
-   *  - factorWeights: UltraTextMatcherTF factorWeights overrides
-   *  - debug: UltraTextMatcherTF debug overrides
-   *  - keywordBoost: { words: ["iphone","pro"], addPerHit: 0.02, maxAdd: 0.08 } (optional)
-   */
   async matchProducts(query, opts = {}) {
     await this.init();
 
@@ -16141,28 +14789,24 @@ class ProductFieldMatcher {
 
     const perCallFieldWeights = { ...(this._opt.fieldWeights || {}), ...(opts.fieldWeights || {}) };
 
-    // Optional small keyword boost (prioritize messages/products containing key words)
     const keywordBoost = opts.keywordBoost || null;
     const boostWords = keywordBoost?.words?.map(w => String(w).toLowerCase()).filter(Boolean) || [];
     const addPerHit = (typeof keywordBoost?.addPerHit === "number") ? keywordBoost.addPerHit : 0.02;
     const maxAdd = (typeof keywordBoost?.maxAdd === "number") ? keywordBoost.maxAdd : 0.08;
 
-    // Run field-level match
     const raw = await this._matcher.match(query, null, {
       perf: { topK: topKFields },
       focus: { ...(opts.focus || {}) },
       factorWeights: { ...(opts.factorWeights || {}) },
       debug: (opts.debug ? { ...(opts.debug || {}) } : undefined),
-
-      // Meta boost: apply fieldWeight + optional keywordBoost (small)
       meta: {
         enabled: true,
         boost: (meta, text) => {
           const field = String(meta?.field || "");
-          const fw = (typeof perCallFieldWeights[field] === "number") ? perCallFieldWeights[field] : (typeof meta?.fieldWeight === "number" ? meta.fieldWeight : 0.2);
+          const fw = (typeof perCallFieldWeights[field] === "number")
+            ? perCallFieldWeights[field]
+            : (typeof meta?.fieldWeight === "number" ? meta.fieldWeight : 0.2);
 
-          // multiplier from field weight (keep gentle)
-          // fw ~ 0.15..1.0 => mult ~ 0.90..1.18
           const mult = 0.90 + 0.28 * clamp01(fw);
 
           let add = 0;
@@ -16177,32 +14821,20 @@ class ProductFieldMatcher {
       }
     });
 
-    // Aggregate field-hits into product-level results
     const byProd = new Map();
-
     const fieldHits = raw.results || [];
+
     for (const hit of fieldHits) {
-      const meta = hit?.diagnostics?.metaBoost ? undefined : undefined; // keep raw payload small
       const d = hit?.diagnostics || {};
-      const m = d?.meta || undefined;
-
-      // We didn’t include meta in diagnostics; so parse from id "pid::field"
-      const id = String(d.id || hit.index || "");
-      let pid = "";
-      let field = "";
+      const id = String(d.id || "");
       const parts = id.split("::");
+      let pid = "", field = "";
       if (parts.length >= 2) { pid = parts[0]; field = parts[1]; }
-
-      // fallback: parse from embedKey if needed
-      if (!pid) pid = parts[0] || "";
 
       const pIndex = this._productIndexById.has(pid) ? this._productIndexById.get(pid) : null;
       if (pIndex === null || pIndex === undefined) continue;
 
       const fw = (typeof perCallFieldWeights[field] === "number") ? perCallFieldWeights[field] : 0.2;
-
-      // Weighted score (but keep bounded)
-      // Use the already meta-boosted hit.score01 as base, then apply a mild extra by fw
       const weighted = clamp01(hit.score01 * (0.92 + 0.20 * clamp01(fw)));
 
       const cur = byProd.get(pid) || {
@@ -16212,10 +14844,9 @@ class ProductFieldMatcher {
         bestConfidence01: 0,
         bestField: "",
         bestFieldText: "",
-        fieldEvidence: [] // top field hits
+        fieldEvidence: []
       };
 
-      // store evidence (limited)
       cur.fieldEvidence.push({
         field,
         score01: hit.score01,
@@ -16224,7 +14855,6 @@ class ProductFieldMatcher {
         textMatched: hit.text
       });
 
-      // choose best
       if (weighted > cur.bestScore01) {
         cur.bestScore01 = weighted;
         cur.bestConfidence01 = hit.confidence01;
@@ -16235,27 +14865,20 @@ class ProductFieldMatcher {
       byProd.set(pid, cur);
     }
 
-    // Final product ranking
     const ranked = Array.from(byProd.values())
       .map(r => {
-        // sort evidence high to low
         r.fieldEvidence.sort((a, b) => b.weightedScore01 - a.weightedScore01);
         r.fieldEvidence = r.fieldEvidence.slice(0, 6);
 
-        // Confidence shaping: combine best field confidence + evidence strength
         const second = r.fieldEvidence[1]?.weightedScore01 ?? 0;
         const gap = clamp01((r.bestScore01 - second) / 0.25);
         const conf = clamp01((r.bestConfidence01 * 0.80) + (0.20 * gap));
 
-        return {
-          ...r,
-          confidence01: conf
-        };
+        return { ...r, confidence01: conf };
       })
       .sort((a, b) => b.bestScore01 - a.bestScore01)
       .slice(0, topKProducts);
 
-    // Attach full product objects
     const results = ranked.map(r => ({
       product: this._products[r.productIndex],
       productId: r.productId,
@@ -16271,16 +14894,13 @@ class ProductFieldMatcher {
       topKProducts,
       topKFields,
       results,
-      debug: {
-        fieldMatchRaw: raw // includes factors breakdown etc from UltraTextMatcherTF
-      }
+      debug: { fieldMatchRaw: raw }
     };
   }
 }
 
 /* ============================================================
-   2) ConversationMatcher (sheet1)
-   - Matches user_message and returns support_message + meta
+   2) ConversationMatcher (UNCHANGED API)
    ============================================================ */
 class ConversationMatcher {
   constructor(convRows = [], options = {}) {
@@ -16292,22 +14912,13 @@ class ConversationMatcher {
   _defaultOptions() {
     return {
       matcherOptions: {
-        debug: {
-          enabled: false,
-          logTimings: true,
-          logWarnings: true,
-          logBatches: false,
-          logCache: false,
-          logTopK: false,
-          logFactorBreakdown: false,
-          groupCollapsed: true
-        },
+        debug: { enabled: false, logTimings: true, logWarnings: true, logTopK: false },
         perf: {
           topK: 5,
-          semanticBatchSize: 64,
-          microYield: { enabled: true, everyItems: 96, strategy: "timeout0" },
+          semanticBatchSize: 128,
+          microYield: { enabled: true, everyItems: 256, strategy: "timeout0" },
           timeBudgetMs: 0,
-          nonSemanticFastPath: false,
+          nonSemanticFastPath: true,
           maxTargetsSafety: 200000
         },
         cache: {
@@ -16315,7 +14926,7 @@ class ConversationMatcher {
           queryFeatureCache: true,
           embeddingCache: true,
           embeddingCacheKey: "hash",
-          embeddingCacheLimitMB: 192,
+          embeddingCacheLimitMB: 64,
           autoClearAfterMatch: false
         },
         meta: {
@@ -16332,10 +14943,10 @@ class ConversationMatcher {
           includeMetaInDiagnostics: false
         },
         focus: {
-          favorMeaning: 1.35,
-          favorNumbers: 1.25,
+          favorMeaning: 1.25,
+          favorNumbers: 1.15,
           favorTokens: 1.25,
-          favorGrammar: 1.1,
+          favorGrammar: 1.0,
           favorPrefix: 1.1
         }
       }
@@ -16347,16 +14958,12 @@ class ConversationMatcher {
     if (typeof b !== "object") return b;
     if (a === null || a === undefined) return b;
     if (typeof a !== "object") return a;
-
     const out = Array.isArray(a) ? a.slice() : { ...a };
     for (const k of Object.keys(b)) {
       const bv = b[k];
       const av = out[k];
-      if (bv && typeof bv === "object" && !Array.isArray(bv) && av && typeof av === "object" && !Array.isArray(av)) {
-        out[k] = this._deepMerge(av, bv);
-      } else {
-        out[k] = bv;
-      }
+      if (bv && typeof bv === "object" && !Array.isArray(bv) && av && typeof av === "object" && !Array.isArray(av)) out[k] = this._deepMerge(av, bv);
+      else out[k] = bv;
     }
     return out;
   }
@@ -16373,9 +14980,7 @@ class ConversationMatcher {
     return t;
   }
 
-  async init() {
-    await this._matcher.init();
-  }
+  async init() { await this._matcher.init(); }
 
   setRows(convRows) {
     this._rows = Array.isArray(convRows) ? convRows : [];
@@ -16395,7 +15000,6 @@ class ConversationMatcher {
       meta: opts.metaOverride ? opts.metaOverride : undefined
     });
 
-    // Attach support_message + row info
     const results = (out.results || []).map(r => {
       const row = this._rows[r.index] || null;
       return {
@@ -16413,8 +15017,6 @@ class ConversationMatcher {
 
 /* ============================================================
    3) Pipeline: Product first, then Message
-   - Finds best product, then matches conversation with same user input
-   - Also returns both debug outputs
    ============================================================ */
 class ProductThenMessageSearch {
   constructor(prodData, convData, options = {}) {
@@ -16427,13 +15029,6 @@ class ProductThenMessageSearch {
     await this.convMatcher.init();
   }
 
-  /**
-   * @param {string} userInput
-   * @param {object} opts
-   *  - product: options for matchProducts(...)
-   *  - conversation: options for matchUserMessage(...)
-   *  - conversationQueryStrategy: "raw" | "appendProductName"
-   */
   async run(userInput, opts = {}) {
     await this.init();
 
@@ -16449,17 +15044,12 @@ class ProductThenMessageSearch {
 
     const messageOut = await this.convMatcher.matchUserMessage(convQuery, opts.conversation || {});
 
-    return {
-      userInput,
-      bestProduct,
-      productOut,
-      messageOut
-    };
+    return { userInput, bestProduct, productOut, messageOut };
   }
 }
 
 /* ============================================================
-   USAGE (with your fetchJsonRobust + sheets)
+   USAGE (your fetchJsonRobust + sheets)
    ============================================================ */
 async function fetchJsonRobust(url) {
   try {
@@ -16476,48 +15066,46 @@ async function fetchJsonRobust(url) {
     return [];
   }
 }
-// 1) Load sheets, 2) build matchers once, 3) run searches many times
+
 async function buildSearchSystem() {
   const [convData, prodData] = await Promise.all([
     fetchJsonRobust("https://script.google.com/macros/s/AKfycbxJec3yxCqQa9QjEapTDl2wlF-ETSumFWwRe5CoAWmn2DcSWOXbba0Auex32_DgCW4liQ/exec"),
     fetchJsonRobust("https://script.google.com/macros/s/AKfycbxHEm4DNrxnqzXvD2Ums6TszXMvyoQEgGMjdnIKiKEngtWH5AeFKpbLyyixjhNB2ZhBGA/exec")
   ]);
 
-  // Create system
   const system = new ProductThenMessageSearch(prodData, convData, {
     product: {
-      fieldWeights: { name: 2.0, brand: 0.55, model: 0.90, tags: 0.45, specifications: 0.25, description: 0.30 },
+      fieldWeights: { name: 2.0, brand: 0.55, model: 0.90, tags: 0.45, specifications: 0.20, description: 0.25 },
       perf: { topKFields: 140 },
       matcherOptions: {
-        debug: { enabled: true, logTimings: true, logTopK: false },
-        focus: { favorMeaning: 1.35, favorNumbers: 1.45, favorTokens: 1.25 }
+        debug: { enabled: false, logTimings: true, logTopK: false },
+        focus: { favorMeaning: 1.25, favorNumbers: 1.35, favorTokens: 1.25 }
       }
     },
     conversation: {
       matcherOptions: {
-        debug: { enabled: true, logTimings: true, logTopK: true }
+        debug: { enabled: false, logTimings: true, logTopK: false }
       }
     }
   });
 
   await system.init();
-  console.log("✅ Search system ready");
+  console.log("✅ FAST Search system ready");
   return system;
 }
 
+/* ============================================================
+   Dhaka location list (unchanged)
+   ============================================================ */
 const dhakaRawList = [
-  "dhaka", "daka", "dhakaa", "dakaa", "gazipur", "gajipur", "gazipurr", "narayanganj", "narayangonj", "narayongonj", "naryanganj", "narsingdi", "narsingdy", "norsingdi", "narsindi", "munshiganj", "munshigonj", "munsiganj", "munsigonj", "manikganj", "manikgonj", "tangail", "tangal", "tangailly", "kishoreganj", "kishoregonj", "kishorganj", "kisorupganj", "faridpur", "foridpur", "pharidpur", "madaripur", "madaripurr", "rajbari", "razbari", "shariatpur", "shariatpurr", "sariatpur", "gopalganj", "gopalgonj", "gupalganj",
-  "dhamrai", "damrai", "dohar", "duhar", "keraniganj", "keranigonj", "keraniganj", "nawabganj", "nawabgonj", "nababganj", "savar", "sabor", "shavar", "ashulia", "asulia", "ashulya", "kaliakair", "kaliakor", "kaliganj", "kaligonj", "kapasia", "kapasya", "sreepur", "sripur", "shreepur", "tongi", "tungi", "konabari", "kunabari", "araihazar", "araihazat", "bandar", "bondar", "rupganj", "rupgonj", "sonargaon", "sonarga", "sonargaonr", "fatullah", "fatulla", "siddhirganj", "siddhirgonj", "shiddirganj", "belabo", "monohardi", "manohardi", "palash", "palas", "raipura", "raypura", "shibpur", "sibpur", "madhabdi", "madobdi", "ghorashal", "ghorashol", "lohajang", "lohojang", "sirajdikhan", "sirajdikhanr", "sreenagar", "srinagar", "shreenagar", "tongibari", "tungibari", "mirkadim", "mirkadimr", "singair", "singayer", "shivalaya", "shibaloy", "saturia", "shaturia", "harirampur", "horirampur", "ghior", "gheor", "daulatpur", "dowlatpur",
-  "adabor", "adaborr", "badda", "badda", "vadda", "banani", "bonani", "bangshal", "bongshal", "bangshalr", "cantonment", "cantonmentr", "chawkbazar", "chokbazar", "chowkbazar", "demra", "demara", "dhanmondi", "dhanmondy", "danmondi", "gulshan", "gulshan1", "gulshan2", "gulshon", "hazaribagh", "hazaribag", "jatrabari", "jatrabari", "jatrabary", "kadamtali", "kodomtoli", "kafrul", "koprul", "kalabagan", "kolabagan", "kamrangirchar", "kamrangirchor", "khilgaon", "khilgon", "khilkhet", "khilkhet", "kotwali", "kotoyali", "lalbagh", "lalbag", "mirpur", "mirpur1", "mirpur10", "mirpur2", "mirpur12", "mirpur11", "mirpur14", "mohammadpur", "mohammadpurr", "mohamadpur", "motijheel", "matijheel", "motijhil", "newmarket", "neumarket", "pallabi", "pallabi", "paltan", "poltan", "ramna", "romna", "rampura", "rompura", "sabujbagh", "sobujbag", "shahbagh", "shahbag", "shabagh", "shyampur", "shampur", "sutrapur", "shutrapur", "tejgaon", "tejgaonr", "tejgon", "turag", "turag", "uttara", "utara", "uttara10", "uttarkhan", "uttorkhan", "dakshinkhan", "dokshinkhan", "vatara", "batara", "wari", "owari", "uoyari", "segunbagicha", "segunbagicha", "farmgate", "farmgate", "farmget", "mohakhali", "mohakhali", "mohakhali", "eskaton", "iskaton", "malibagh", "malibag", "basabo", "bashabo", "banasree", "bonosree", "aftabnagar", "aftabnagar", "niketan", "niketon", "nikunja", "nikunja"
+  "dhaka","daka","dhakaa","dakaa","gazipur","gajipur","gazipurr","narayanganj","narayangonj","narayongonj","naryanganj","narsingdi","narsingdy","norsingdi","narsindi","munshiganj","munshigonj","munsiganj","munsigonj","manikganj","manikgonj","tangail","tangal","tangailly","kishoreganj","kishoregonj","kishorganj","kisorupganj","faridpur","foridpur","pharidpur","madaripur","madaripurr","rajbari","razbari","shariatpur","shariatpurr","sariatpur","gopalganj","gopalgonj","gupalganj",
+  "dhamrai","damrai","dohar","duhar","keraniganj","keranigonj","keraniganj","nawabganj","nawabgonj","nababganj","savar","sabor","shavar","ashulia","asulia","ashulya","kaliakair","kaliakor","kaliganj","kaligonj","kapasia","kapasya","sreepur","sripur","shreepur","tongi","tungi","konabari","kunabari","araihazar","araihazat","bandar","bondar","rupganj","rupgonj","sonargaon","sonarga","sonargaonr","fatullah","fatulla","siddhirganj","siddhirgonj","shiddirganj","belabo","monohardi","manohardi","palash","palas","raipura","raypura","shibpur","sibpur","madhabdi","madobdi","ghorashal","ghorashol","lohajang","lohojang","sirajdikhan","sirajdikhanr","sreenagar","srinagar","shreenagar","tongibari","tungibari","mirkadim","mirkadimr","singair","singayer","shivalaya","shibaloy","saturia","shaturia","harirampur","horirampur","ghior","gheor","daulatpur","dowlatpur",
+  "adabor","adaborr","badda","badda","vadda","banani","bonani","bangshal","bongshal","bangshalr","cantonment","cantonmentr","chawkbazar","chokbazar","chowkbazar","demra","demara","dhanmondi","dhanmondy","danmondi","gulshan","gulshan1","gulshan2","gulshon","hazaribagh","hazaribag","jatrabari","jatrabari","jatrabary","kadamtali","kodomtoli","kafrul","koprul","kalabagan","kolabagan","kamrangirchar","kamrangirchor","khilgaon","khilgon","khilkhet","khilkhet","kotwali","kotoyali","lalbagh","lalbag","mirpur","mirpur1","mirpur10","mirpur2","mirpur12","mirpur11","mirpur14","mohammadpur","mohammadpurr","mohamadpur","motijheel","matijheel","motijhil","newmarket","neumarket","pallabi","pallabi","paltan","poltan","ramna","romna","rampura","rompura","sabujbagh","sobujbag","shahbagh","shahbag","shabagh","shyampur","shampur","sutrapur","shutrapur","tejgaon","tejgaonr","tejgon","turag","turag","uttara","utara","uttara10","uttarkhan","uttorkhan","dakshinkhan","dokshinkhan","vatara","batara","wari","owari","uoyari","segunbagicha","segunbagicha","farmgate","farmgate","farmget","mohakhali","mohakhali","mohakhali","eskaton","iskaton","malibagh","malibag","basabo","bashabo","banasree","bonosree","aftabnagar","aftabnagar","niketan","niketon","nikunja","nikunja"
 ];
 
-// ✅ Drop-in replacement (keeps the same class name) — backward compatible
-// - Accepts 3rd arg as either userInputVar (string) OR options object
-// - Stores last 2 user inputs + last 2 final texts
-// - Extracts payment/contact/transaction info from last 4 texts (2 inputs + 2 outputs)
-// - Delivery charge placeholder logic based on delivery words + Dhaka-area location detection
-// - Lots of console logging, but otherwise “hidden work” (no UI changes)
-
+/* ============================================================
+   ResponseFilter (your original, unchanged)
+   ============================================================ */
 class ResponseFilter {
   static STORAGE_KEY = "ResponseFilter::state_v2";
 
@@ -16526,16 +15114,10 @@ class ResponseFilter {
       throw new Error("There was a problem with products or responses!");
     }
 
-    // Backward compatible handling:
-    // Your current call is: new ResponseFilter(products, responses, userInputVar)
-    // Here we support both:
-    //   - (products, responses, "user input string")
-    //   - (products, responses, { userInputVar: "...", minProductConfidence: ... })
     const isStringArg = typeof userInputVarOrOptions === "string";
     const options = isStringArg ? {} : (userInputVarOrOptions ?? {});
     this.userInputVar = isStringArg ? userInputVarOrOptions : (options.userInputVar ?? "");
 
-    // If the page was refreshed (reload), reset the saved state
     if (ResponseFilter.#isReloadSafe()) {
       console.log("[ResponseFilter] Reload detected → clearing storage");
       ResponseFilter.clearStorage();
@@ -16550,20 +15132,13 @@ class ResponseFilter {
 
     this.productList = [];
 
-    // Load old state (history + extracted info)
     this.state = ResponseFilter.loadFromStorage() ?? ResponseFilter.#defaultState();
     console.log("[ResponseFilter] Loaded state:", this.state);
 
-    // Store product info
     this.storeProduct();
-
-    // Save current state (will also update after replacePlaceholders)
     this.saveToStorage();
   }
 
-  // ------------------------------
-  // Product storing
-  // ------------------------------
   storeProduct() {
     const product = this.products?.[0];
     if (!product) {
@@ -16575,18 +15150,12 @@ class ResponseFilter {
       this.productList.push(product.product);
       console.log("[ResponseFilter] Stored product:", product.product);
     } else if (product.confidence01 > 0.5) {
-      console.log(
-        "[ResponseFilter] Product confidence < 0.60 but > 0.50:",
-        product.confidence01
-      );
+      console.log("[ResponseFilter] Product confidence < 0.60 but > 0.50:", product.confidence01);
     } else {
       console.log("[ResponseFilter] Product confidence very low:", product.confidence01);
     }
   }
 
-  // ------------------------------
-  // Placeholder replacing + intelligence layer
-  // ------------------------------
   replacePlaceholders() {
     let text = this.responses?.[0]?.support_message;
 
@@ -16595,24 +15164,11 @@ class ResponseFilter {
       return text ?? "";
     }
 
-    // 1) Standard product placeholder logic (existing behavior)
     text = this.#replaceProductPlaceholders(text);
-
-    // 2) Delivery charge placeholder logic (new)
-    // Decide delivery charge BEFORE storing current output, using:
-    // last (up to) 2 inputs + current input + last (up to) 2 outputs  => up to 5,
-    // but we only need “last 4 texts” idea; we’ll use:
-    // prev 1 input + current input + prev 2 outputs (max 4) as pre-context.
     text = this.#replaceDeliveryChargePlaceholder(text);
 
-    // 3) Now we have a “final text” for this call.
-    // Store history (last 2 user inputs + last 2 final texts)
     this.#storeConversationTurn(this.userInputVar, text);
-
-    // 4) Extract payment/contact/transaction info from last 4 texts (2 inputs + 2 outputs)
     this.#extractAndSaveSignalsFromLastFourTexts();
-
-    // 5) Save updated state
     this.saveToStorage();
 
     console.log("[ResponseFilter] Final output text:", text);
@@ -16629,20 +15185,14 @@ class ResponseFilter {
     if (placeholders.includes("last_product")) {
       text = text.replaceAll("[last_product]", lastProduct?.name ?? "");
       if (placeholders.includes("price")) {
-        text = text.replaceAll(
-          "[price]",
-          `${lastProduct?.price ?? ""}${this.currency}`
-        );
+        text = text.replaceAll("[price]", `${lastProduct?.price ?? ""}${this.currency}`);
       }
     }
 
     if (placeholders.includes("first_product")) {
       text = text.replaceAll("[first_product]", firstProduct?.name ?? "");
       if (placeholders.includes("price")) {
-        text = text.replaceAll(
-          "[price]",
-          `${firstProduct?.price ?? ""}${this.currency}`
-        );
+        text = text.replaceAll("[price]", `${firstProduct?.price ?? ""}${this.currency}`);
       }
     }
 
@@ -16653,11 +15203,9 @@ class ResponseFilter {
     const hasDeliveryChargePlaceholder = /\[delivery_charge\]/i.test(text);
     if (!hasDeliveryChargePlaceholder) return text;
 
-    const lastInputs = this.state.history.userInputs.slice(-1); // prev 1
-    const lastOutputs = this.state.history.finalTexts.slice(-2); // prev 2
-    const preContext = [...lastInputs, this.userInputVar, ...lastOutputs]
-      .filter(Boolean)
-      .slice(-4);
+    const lastInputs = this.state.history.userInputs.slice(-1);
+    const lastOutputs = this.state.history.finalTexts.slice(-2);
+    const preContext = [...lastInputs, this.userInputVar, ...lastOutputs].filter(Boolean).slice(-4);
 
     const joined = preContext.join(" \n ");
     const deliveryMentioned = ResponseFilter.#containsDeliveryTopic(joined);
@@ -16670,16 +15218,10 @@ class ResponseFilter {
     const charge = deliveryMentioned && hasDhakaLocation ? 60 : 120;
     const replaceValue = `${charge}${this.currency}`;
 
-    console.log(
-      `[ResponseFilter] Replacing [delivery_charge] with: ${replaceValue} (DhakaMatch=${hasDhakaLocation})`
-    );
-
+    console.log(`[ResponseFilter] Replacing [delivery_charge] with: ${replaceValue} (DhakaMatch=${hasDhakaLocation})`);
     return text.replaceAll("[delivery_charge]", replaceValue);
   }
 
-  // ------------------------------
-  // History storage (last 2 + last 2)
-  // ------------------------------
   #storeConversationTurn(userInput, finalText) {
     const inputStr = String(userInput ?? "").trim();
     const outputStr = String(finalText ?? "").trim();
@@ -16697,9 +15239,6 @@ class ResponseFilter {
     }
   }
 
-  // ------------------------------
-  // Extraction logic (payment/contact/transaction)
-  // ------------------------------
   #extractAndSaveSignalsFromLastFourTexts() {
     const inputs = this.state.history.userInputs.slice(-2);
     const outputs = this.state.history.finalTexts.slice(-2);
@@ -16712,19 +15251,12 @@ class ResponseFilter {
     const deliveryTopic = ResponseFilter.#containsDeliveryTopic(joined);
     const methodsFound = ResponseFilter.#extractBangladeshPaymentMethods(joined);
 
-    // 11-digit BD numbers starting with 01
     const numbers01 = ResponseFilter.#extractPhoneNumbers01(joined);
 
-    // Contact number logic:
-    // if phone/mobile/contact keywords exist AND number exists => store as contactNumber
     const contactTopic = ResponseFilter.#containsContactTopic(joined);
     const contactNumber = contactTopic && numbers01.length ? numbers01[0] : null;
 
-    // Payment number logic:
-    // if payment topic AND number exists => store as paymentNumber
     const paymentNumber = paymentTopic && numbers01.length ? numbers01[0] : null;
-
-    // Transaction ID logic:
     const transactionId = ResponseFilter.#extractTransactionId(joined);
 
     console.log("[ResponseFilter] paymentTopic:", paymentTopic);
@@ -16734,11 +15266,9 @@ class ResponseFilter {
     console.log("[ResponseFilter] payment methods found:", methodsFound);
     console.log("[ResponseFilter] transactionId found:", transactionId);
 
-    // Update state dictionary
     const prev = this.state.signals.paymentInfo ?? {};
     const now = Date.now();
 
-    // Only set fields when detected (don’t overwrite with null)
     const nextPaymentInfo = {
       ...prev,
       paymentNumber: paymentNumber ?? prev.paymentNumber ?? null,
@@ -16749,10 +15279,6 @@ class ResponseFilter {
       updatedAt: now,
     };
 
-    // Extra: if payment topic AND any method found but no number, still store methods.
-    // Extra: if payment topic AND number found but no method, store number anyway.
-
-    // If payment-related mention exists and we found a number and/or methods or trxid, save.
     const shouldSave =
       paymentTopic ||
       methodsFound.length > 0 ||
@@ -16766,7 +15292,6 @@ class ResponseFilter {
       console.log("[ResponseFilter] No strong payment/contact/trx signal → not updating paymentInfo");
     }
 
-    // Save delivery signal snapshot too (optional but useful)
     const hasDhakaLocation = ResponseFilter.#containsDhakaLocation(joined);
     this.state.signals.deliveryInfo = {
       deliveryTopic,
@@ -16777,9 +15302,6 @@ class ResponseFilter {
     console.log("[ResponseFilter] Updated deliveryInfo:", this.state.signals.deliveryInfo);
   }
 
-  // ------------------------------
-  // localStorage helpers
-  // ------------------------------
   saveToStorage() {
     try {
       const stateToSave = {
@@ -16814,7 +15336,6 @@ class ResponseFilter {
       if (!raw) return null;
 
       const parsed = JSON.parse(raw);
-      // Ensure structure safety
       const safe = {
         ...ResponseFilter.#defaultState(),
         ...parsed,
@@ -16844,15 +15365,9 @@ class ResponseFilter {
     }
   }
 
-  // ------------------------------
-  // Safety + defaults
-  // ------------------------------
   static #defaultState() {
     return {
-      history: {
-        userInputs: [],
-        finalTexts: [],
-      },
+      history: { userInputs: [], finalTexts: [] },
       signals: {
         paymentInfo: {
           paymentNumber: null,
@@ -16875,11 +15390,7 @@ class ResponseFilter {
   }
 
   static #hasLocalStorage() {
-    try {
-      return typeof localStorage !== "undefined";
-    } catch {
-      return false;
-    }
+    try { return typeof localStorage !== "undefined"; } catch { return false; }
   }
 
   static #isReloadSafe() {
@@ -16887,32 +15398,23 @@ class ResponseFilter {
       const perf = typeof performance !== "undefined" ? performance : null;
       const nav = perf?.getEntriesByType?.("navigation")?.[0];
       return nav?.type === "reload";
-    } catch {
-      return false;
-    }
+    } catch { return false; }
   }
 
-  // ------------------------------
-  // Text detection helpers
-  // ------------------------------
   static #norm(s) {
     return String(s ?? "")
       .toLowerCase()
-      .replace(/[\u09E6-\u09EF]/g, (d) => "০১২৩৪৫৬৭৮৯".indexOf(d)) // basic bn-digit mapping (best-effort)
+      .replace(/[\u09E6-\u09EF]/g, (d) => "০১২৩৪৫৬৭৮৯".indexOf(d))
       .replace(/[^a-z0-9\s]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
   }
 
   static #containsAny(normText, patterns) {
-    return patterns.some((p) => {
-      if (p instanceof RegExp) return p.test(normText);
-      return normText.includes(String(p));
-    });
+    return patterns.some((p) => (p instanceof RegExp) ? p.test(normText) : normText.includes(String(p)));
   }
 
   static #extractPhoneNumbers01(text) {
-    // Accept both raw and normalized scanning (raw keeps digits intact)
     const raw = String(text ?? "");
     const matches = raw.match(/\b01\d{9}\b/g) ?? [];
     return Array.from(new Set(matches));
@@ -16920,116 +15422,40 @@ class ResponseFilter {
 
   static #containsPaymentTopic(text) {
     const t = ResponseFilter.#norm(text);
-
-    // payment related + common typos
     const patterns = [
-      "payment",
-      "paymnt",
-      "paymant",
-      "paymet",
-      "pament",
-      "pymnt",
-      "paid",
-      "pay",
-      "bkash",
-      "b kash",
-      "nagad",
-      "nogod",
-      "rocket",
-      "roket",
-      "upay",
-      "upai",
-      "bank",
-      "card",
-      "visa",
-      "master",
-      "debit",
-      "credit",
-      "cod",
-      "cash on delivery",
-      "cash",
-      "advance",
-      "due",
-      "baki",
-      "bakii",
-      "baki",
-      "bk",
-      "nagad",
-      "trx",
-      "trnx",
-      "txid",
-      "transaction",
-      "transection",
-      "transfer",
-      "send money",
-      "sendmoney",
+      "payment","paymnt","paymant","paymet","pament","pymnt","paid","pay",
+      "bkash","b kash","nagad","nogod","rocket","roket","upay","upai",
+      "bank","card","visa","master","debit","credit","cod","cash on delivery","cash",
+      "advance","due","baki","bakii","trx","trnx","txid","transaction","transection",
+      "transfer","send money","sendmoney",
     ];
-
     return ResponseFilter.#containsAny(t, patterns);
   }
 
   static #containsContactTopic(text) {
     const t = ResponseFilter.#norm(text);
-    const patterns = [
-      "phone",
-      "fone",
-      "mobile",
-      "mbl",
-      "mob",
-      "number",
-      "nmbr",
-      "num",
-      "contact",
-      "cntct",
-      "call",
-      "phn",
-      "cell",
-      "whatsapp",
-      "imo",
-    ];
+    const patterns = ["phone","fone","mobile","mbl","mob","number","nmbr","num","contact","cntct","call","phn","cell","whatsapp","imo"];
     return ResponseFilter.#containsAny(t, patterns);
   }
 
   static #containsDeliveryTopic(text) {
     const t = ResponseFilter.#norm(text);
     const patterns = [
-      "delivery",
-      "delivary",
-      "delivary",
-      "delvery",
-      "deliveri",
-      "deliver",
-      "shipping",
-      "shiping",
-      "ship",
-      "courier",
-      "curier",
-      "pathao",
-      "steadfast",
-      "sundarban",
-      "charge",
-      "delivery charge",
-      "home delivery",
-      "address",
-      "addres",
-      "location",
-      "locaton",
-      "loc",
-      "area",
-      "thana",
-      "post office",
-      "postcode",
+      "delivery","delivary","delvery","deliveri","deliver",
+      "shipping","shiping","ship","courier","curier",
+      "pathao","steadfast","sundarban",
+      "charge","delivery charge","home delivery",
+      "address","addres","location","locaton","loc","area","thana",
+      "post office","postcode",
     ];
     return ResponseFilter.#containsAny(t, patterns);
   }
 
   static #extractBangladeshPaymentMethods(text) {
     const t = ResponseFilter.#norm(text);
-
-    // Keep it conservative: only Bangladesh-common methods
     const methodMatchers = [
       { name: "bKash", re: /\b(bkash|b kash|bkaash|bksh|bikash)\b/ },
-      { name: "Nagad", re: /\b(nagad|nogod|nagod|nagad)\b/ },
+      { name: "Nagad", re: /\b(nagad|nogod|nagod)\b/ },
       { name: "Rocket", re: /\b(rocket|roket|dbbl rocket|dbbl)\b/ },
       { name: "Upay", re: /\b(upay|upai|upoye)\b/ },
       { name: "Bank Transfer", re: /\b(bank|transfer|rtgs|beftn)\b/ },
@@ -17037,46 +15463,30 @@ class ResponseFilter {
       { name: "COD", re: /\b(cod|cash on delivery)\b/ },
       { name: "Cash", re: /\b(cash)\b/ },
     ];
-
     const found = [];
-    for (const m of methodMatchers) {
-      if (m.re.test(t)) found.push(m.name);
-    }
+    for (const m of methodMatchers) if (m.re.test(t)) found.push(m.name);
     return found;
   }
 
   static #extractTransactionId(text) {
     const raw = String(text ?? "");
     const norm = ResponseFilter.#norm(raw);
-
-    // Keywords (typo tolerant)
     const hasTrxKeyword = /\b(trx|trxn|trnx|txn|txid|transaction|transection)\b/.test(norm);
     if (!hasTrxKeyword) return null;
 
-    // Try to capture an ID near keywords in raw text (keep alphanumeric)
-    // Example: "TrxID: 8A7B12CD", "transaction id 1234567890", etc.
     const candidates = [];
-
-    // Pattern 1: keyword then separator then id
-    const re1 =
-      /(trx(?:id)?|trxn|trnx|txn(?:id)?|txid|transaction(?:\s*id)?|transection(?:\s*id)?)\s*[:\-#]?\s*([a-zA-Z0-9]{6,30})/gi;
+    const re1 = /(trx(?:id)?|trxn|trnx|txn(?:id)?|txid|transaction(?:\s*id)?|transection(?:\s*id)?)\s*[:\-#]?\s*([a-zA-Z0-9]{6,30})/gi;
     let m;
-    while ((m = re1.exec(raw)) !== null) {
-      candidates.push(m[2]);
-    }
+    while ((m = re1.exec(raw)) !== null) candidates.push(m[2]);
 
-    // Pattern 2: "id" explicitly
     const re2 = /\b(id)\s*[:\-#]?\s*([a-zA-Z0-9]{6,30})\b/gi;
-    while ((m = re2.exec(raw)) !== null) {
-      candidates.push(m[2]);
-    }
+    while ((m = re2.exec(raw)) !== null) candidates.push(m[2]);
 
     const uniq = Array.from(new Set(candidates)).filter(Boolean);
     return uniq[0] ?? null;
   }
 
   static #containsDhakaLocation(text) {
-    // Uses your global dhakaRawList
     const list = Array.isArray(globalThis.dhakaRawList)
       ? globalThis.dhakaRawList
       : (typeof dhakaRawList !== "undefined" ? dhakaRawList : []);
@@ -17088,15 +15498,11 @@ class ResponseFilter {
 
     const t = ResponseFilter.#norm(text);
 
-    // Build a quick lookup once (cached on the class)
     if (!ResponseFilter._dhakaLookup) {
       ResponseFilter._dhakaLookup = new Set(list.map((x) => ResponseFilter.#norm(x)));
       console.log("[ResponseFilter] Built Dhaka lookup set:", ResponseFilter._dhakaLookup.size);
     }
 
-    // Fast contains check:
-    // - For single tokens: includes check
-    // - For multi-word: also includes check (because norm keeps spaces)
     for (const loc of ResponseFilter._dhakaLookup) {
       if (!loc) continue;
       if (t.includes(loc)) return true;
@@ -17104,25 +15510,20 @@ class ResponseFilter {
     return false;
   }
 }
-//[login_image] [registration_image] [cart_image] [checkout_image]
 
-//[payment_method_image] [payment_details_image] [place_order_image]
-
-//[wishlist_image] [reviews_image] [write_review_image]
-
-// Cache the built system so you don’t rebuild it every call
+/* ============================================================
+   Cached system (unchanged)
+   ============================================================ */
 let _systemPromise = null;
 async function getSearchSystem() {
   if (!_systemPromise) _systemPromise = buildSearchSystem();
   return _systemPromise;
 }
 
-// General function: takes ANY variable, parses it into a clean user query string
 function parseUserInput(inputVar) {
   return String(inputVar ?? "").trim();
 }
 
-// Main function: returns ONLY the final text
 async function runSearchAndReturnFinalText(userInputVar) {
   const userQuery = parseUserInput(userInputVar);
   if (!userQuery) return "";
@@ -17133,22 +15534,20 @@ async function runSearchAndReturnFinalText(userInputVar) {
     product: {
       topKProducts: 2,
       topKFields: 180,
-      focus: { favorNumbers: 2.0, favorMeaning: 1.25, favorTokens: 1.4 },
-      // keywordBoost: { words: ["iphone", "pro", "max"], addPerHit: 0.02, maxAdd: 0.08 }
+      focus: { favorNumbers: 1.8, favorMeaning: 1, favorTokens: 0.5 },
     },
     conversation: {
       topK: 3,
-      focus: { favorMeaning: 1.4, favorTokens: 1.2 },
+      focus: { favorMeaning: 1.85, favorTokens: 1.8 },
     },
-    conversationQueryStrategy: "raw", // or "appendProductName"
+    conversationQueryStrategy: "raw",
   });
 
-  // Return ONLY the final text (no debug)
   return new ResponseFilter(out.productOut.results, out.messageOut.results, userInputVar)
     .replacePlaceholders();
 }
 
-
+//ghowhqergiojqoiru98234uyhrnogliwjegroptgu39845hytgg4j5o398ut9he3rpoiutgy8394p3o4i09t6uj5jiojjygg05394uyg8jh34ioj5tygj30945u
 
 function sendBotResponse(user_input) {
   runSearchAndReturnFinalText(user_input)
