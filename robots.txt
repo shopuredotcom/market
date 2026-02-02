@@ -1,0 +1,23 @@
+# ======================================================
+# ShoPure Robots Configuration
+# ======================================================
+
+User-agent: *
+Allow: /
+
+# Block non-public paths (future-safe)
+Disallow: /admin/
+Disallow: /private/
+Disallow: /temp/
+
+# Allow assets
+Allow: /assets/
+Allow: /images/
+Allow: /css/
+Allow: /js/
+
+# Crawl settings
+Crawl-delay: 5
+
+# Sitemap (active when hosted)
+Sitemap: ./sitemap.xml

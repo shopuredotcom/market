@@ -1,0 +1,22 @@
+/* =====================================================
+   ShoPure – Humans Behind the Product
+   ===================================================== */
+
+Project: ShoPure
+Description: Smart & Secure E-commerce Platform
+
+Developer: Didarul Islam
+Role: Full Stack Developer
+Location: Bangladesh
+
+Technologies:
+- HTML5
+- CSS3
+- JavaScript
+- Font Awesome
+- PWA
+
+Contact:
+Email: shopuredotcom@gmail.com
+
+Last Updated: 2026-01-01
